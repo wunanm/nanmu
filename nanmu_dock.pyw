@@ -53,6 +53,7 @@ import win32con
 import win32gui
 import win32process
 import win32com.client
+from win32com.shell import shell, shellcon
 
 APP_NAME = "楠木 Dock"
 APP_VERSION = "1.1.0"
@@ -143,6 +144,82 @@ def is_web_url(path):
     return "://" in path and not os.path.exists(path)
 
 
+# ---------------------------------------------------------------- 系统项目（回收站、此电脑…）
+# 这些是 Windows 的“虚拟文件夹”，没有真实路径，用 shell:xxx 或 ::{CLSID} 表示
+
+RECYCLE_BIN = "shell:RecycleBinFolder"
+RECYCLE_BIN_CLSID = "::{645FF040-5081-101B-9F08-00AA002F954E}"
+SYSTEM_ITEMS = [("回收站", RECYCLE_BIN), ("此电脑", "shell:MyComputerFolder"),
+                ("控制面板", "::{26EE0668-A00A-44D7-9371-BEB064C98683}"), ("网络", "shell:NetworkPlacesFolder"),
+                ("下载", "shell:Downloads")]
+IMAGERES = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "imageres.dll")
+
+
+def is_shell_path(path):
+    return path.startswith("::") or path.lower().startswith("shell:")
+
+
+def launch_target(path):
+    return "shell:" + path if path.startswith("::") else path
+
+
+def shell_pidl(path):
+    try:
+        return shell.SHGetDesktopFolder().ParseDisplayName(0, None, launch_target(path), 0)[1]
+    except Exception:
+        try:      # ::{CLSID} 形式不带 shell: 前缀也试一次
+            return shell.SHGetDesktopFolder().ParseDisplayName(0, None, path, 0)[1]
+        except Exception:
+            return None
+
+
+def shell_name(path, kind=None):
+    pidl = shell_pidl(path)
+    if pidl is None:
+        return None
+    try:
+        return shell.SHGetNameFromIDList(pidl, kind if kind is not None else shellcon.SIGDN_NORMALDISPLAY)
+    except Exception:
+        return None
+
+
+def is_recycle_bin(path):
+    return is_shell_path(path) and (path.lower() == RECYCLE_BIN.lower()
+                                    or shell_name(path, shellcon.SIGDN_DESKTOPABSOLUTEPARSING) == RECYCLE_BIN_CLSID)
+
+
+def recycle_bin_full():
+    try:
+        return shell.SHQueryRecycleBin(None)[1] > 0
+    except Exception:
+        return False
+
+
+def shell_icon_image(path):
+    """系统项目的图标：先查图标所在的文件和序号取高清版，不行就要一个普通大小的"""
+    if is_recycle_bin(path):
+        return extract_icon(IMAGERES, -54 if recycle_bin_full() else -55)
+    pidl = shell_pidl(path)
+    if pidl is None:
+        return None
+    try:
+        _, (_, idx, _, icon_file, _) = shell.SHGetFileInfo(pidl, 0, shellcon.SHGFI_PIDL | shellcon.SHGFI_ICONLOCATION)
+        img = extract_icon(os.path.expandvars(icon_file), idx) if icon_file else None
+        if img is not None:
+            return img
+        _, (hicon, _, _, _, _) = shell.SHGetFileInfo(pidl, 0, shellcon.SHGFI_PIDL | shellcon.SHGFI_ICON |
+                                                     shellcon.SHGFI_LARGEICON)
+        if hicon:
+            try:
+                img = QImage.fromHICON(hicon)
+            finally:
+                user32.DestroyIcon(hicon)
+            return None if img.isNull() else img
+    except Exception:
+        pass
+    return None
+
+
 def read_lnk(path):
     """返回 (目标路径, 图标文件, 图标序号)"""
     try:
@@ -223,6 +300,10 @@ def shell_icon(path):
 
 
 def load_icon_image(path):
+    if is_shell_path(path):
+        img = shell_icon_image(path)
+        if img is not None:
+            return img
     src, idx = path, 0
     ext = os.path.splitext(path)[1].lower()
     if ext == ".lnk":
@@ -263,6 +344,8 @@ def exe_description(path):
 
 
 def display_name(path):
+    if is_shell_path(path):
+        return shell_name(path) or path
     if is_web_url(path):
         return path.split("://", 1)[1].split("/", 1)[0] or path
     p = path.rstrip("\\/")
@@ -504,16 +587,27 @@ def focus_window(hwnd):
 class WindowMonitor(QThread):
     """后台每秒枚举一次窗口（只是 EnumWindows，几毫秒），按程序分组"""
     updated = Signal(object)     # [(exe 规范路径, exe 原始路径, [hwnd...])]，按首次出现的 Z 序
+    recycle_state = Signal(bool)  # 回收站 空 / 有东西 变了
 
     def __init__(self):
         super().__init__()
         self._poke = threading.Event()
+        self.watch_recycle = lambda: False      # Dock 上有回收站图标时才查
+        self._recycle_full = None
 
     def poke(self):
         self._poke.set()
 
     def run(self):
+        tick, poked = 0, False
         while not self.isInterruptionRequested():
+            tick += 1
+            # 回收站状态每 3 秒查一次（被 poke 时立刻查，比如刚删了文件）
+            if self.watch_recycle() and (tick % 3 == 0 or self._recycle_full is None or poked):
+                full = recycle_bin_full()
+                if full != self._recycle_full:
+                    self._recycle_full = full
+                    self.recycle_state.emit(full)
             groups = {}
             try:
                 for hwnd, key, path in enum_app_windows():
@@ -527,7 +621,8 @@ class WindowMonitor(QThread):
             except Exception as e:
                 log_error("窗口枚举失败: %r" % e)
             self.updated.emit([(k, p, hs) for k, (p, hs) in groups.items()])
-            if self._poke.wait(1.0):
+            poked = self._poke.wait(1.0)
+            if poked:
                 self._poke.clear()
                 self.msleep(500)
 
@@ -651,6 +746,8 @@ class DockItem:
         self.args = args
         self.pinned = pinned
         self.target = resolve_exe(path)
+        self.is_recycle = is_recycle_bin(path)
+        self.recycle_full = recycle_bin_full() if self.is_recycle else False
         img = image if image is not None else load_icon_image(path)
         self._full_res = max(img.width(), img.height())     # 原图有多大，调大图标时用来判断要不要重新读
         self.image = shrink_icon(img)
@@ -1239,6 +1336,7 @@ class Dock(QWidget):
         self.drag_idx = None
         self.ext_drag = False
         self.drop_idx = None
+        self.drop_on = None           # 文件正拖在回收站图标上
         self.menu_open = False
         self.user_hidden = False
         self.fs_hidden = False
@@ -1255,6 +1353,8 @@ class Dock(QWidget):
 
         self.monitor = WindowMonitor()
         self.monitor.updated.connect(self.on_windows_update)
+        self.monitor.recycle_state.connect(self.on_recycle_state)
+        self.monitor.watch_recycle = lambda: any(it.is_recycle for it in list(self.items))
         self.monitor.start()
 
         self.launch_failed.connect(lambda n, err: self.tray_message("启动失败：" + n, err))
@@ -1735,7 +1835,7 @@ class Dock(QWidget):
         if self.reveal > 0.5:
             p.fillRect(bar, QColor(0, 0, 0, 1))     # 透明皮肤 / 低不透明度时也能接住鼠标
 
-        hovered_item = None
+        hovered_item = drop_rect = None
         if self.reveal > 0.01:
             p.setOpacity(min(1.0, self.reveal * 1.5))
             path = bar_path(th, bar)
@@ -1765,6 +1865,8 @@ class Dock(QWidget):
                            path, ind_y, B, dpr)
                 if hovered:
                     hovered_item = (item, rect)
+                if item is self.drop_on:
+                    drop_rect = rect
 
             mrect = self.mascot_rect(bar)
             if mrect is not None:
@@ -1775,7 +1877,9 @@ class Dock(QWidget):
                     outer = "left" if self.cfg.get("mascot_side") == "left" else "right"
                     self.draw_label(p, self.mascot_line, mrect, beside=outer)
 
-            if hovered_item and self.hover_amt > 0.5 and not self.preview.isVisible():
+            if drop_rect is not None:
+                self.draw_label(p, "移到回收站", drop_rect, red=True)
+            elif hovered_item and self.hover_amt > 0.5 and not self.preview.isVisible():
                 self.draw_label(p, hovered_item[0].name, hovered_item[1])
 
         # 正在拖动的图标
@@ -1886,35 +1990,108 @@ class Dock(QWidget):
 
     # ---------- 外部拖入
 
+    SHELL_IDLIST = 'application/x-qt-windows-mime;value="Shell IDList Array"'
+
+    def drag_paths(self, mime):
+        """拖进来的东西 → 路径列表。回收站、此电脑这类虚拟项目没有文件路径，
+        Windows 只给“Shell IDList”，从里面解析出 ::{CLSID} 形式的名字"""
+        if mime.hasUrls():
+            return [os.path.normpath(u.toLocalFile()) if u.isLocalFile() else u.toString() for u in mime.urls()]
+        paths = []
+        if mime.hasFormat(self.SHELL_IDLIST):
+            try:
+                parent, children = shell.StringAsCIDA(bytes(mime.data(self.SHELL_IDLIST)))
+                for child in children:
+                    paths.append(shell.SHGetNameFromIDList(parent + child, shellcon.SIGDN_DESKTOPABSOLUTEPARSING))
+            except Exception as ex:
+                log_error("解析拖入的系统项目失败: %r" % ex)
+        return paths
+
+    def recycle_drop_target(self, e):
+        """文件拖到回收站图标上 = 删除"""
+        mime = e.mimeData()
+        if not mime.hasUrls() or not all(u.isLocalFile() for u in mime.urls()):
+            return None
+        item = self.item_at(e.position())
+        return item if item is not None and item.is_recycle else None
+
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        mime = e.mimeData()
+        if mime.hasUrls() or mime.hasFormat(self.SHELL_IDLIST):
             e.acceptProposedAction()
             self.ext_drag = True
-            self.mouse_pos = e.position()
-            self.drop_idx = self.calc_drop_idx(e.position().x())
-            self.kick()
+            self.dragMoveEvent(e)
 
     def dragMoveEvent(self, e):
-        e.acceptProposedAction()
         self.mouse_pos = e.position()
-        self.drop_idx = self.calc_drop_idx(e.position().x())
+        self.drop_on = self.recycle_drop_target(e)
+        if self.drop_on is not None:
+            self.drop_idx = None
+            e.setDropAction(Qt.MoveAction)
+            e.accept()
+        else:
+            self.drop_idx = self.calc_drop_idx(e.position().x())
+            e.acceptProposedAction()
         self.kick()
 
     def dragLeaveEvent(self, _):
         self.ext_drag = False
-        self.drop_idx = None
+        self.drop_idx = self.drop_on = None
         self.hide_after = time.monotonic() + 0.6
         self.kick()
 
     def dropEvent(self, e):
         idx = self.drop_idx if self.drop_idx is not None else len(self.items)
-        paths = []
-        for url in e.mimeData().urls():
-            paths.append(os.path.normpath(url.toLocalFile()) if url.isLocalFile() else url.toString())
+        paths = self.drag_paths(e.mimeData())
+        to_recycle = self.drop_on is not None
         self.ext_drag = False
-        self.drop_idx = None
+        self.drop_idx = self.drop_on = None
+        if to_recycle:
+            e.setDropAction(Qt.MoveAction)
+            e.accept()
+            self.send_to_recycle_bin(paths)
+            self.kick()
+            return
         self.add_paths(paths, idx)
         e.acceptProposedAction()
+
+    # ---------- 回收站
+
+    def send_to_recycle_bin(self, paths):
+        """用 Windows 自己的删除（进回收站、可恢复，按系统设置弹确认框），放到线程里免得卡住 Dock"""
+        def run():
+            pythoncom.CoInitialize()
+            try:
+                shell.SHFileOperation((0, shellcon.FO_DELETE, "\0".join(paths), None, shellcon.FOF_ALLOWUNDO,
+                                       None, None))
+            except Exception as ex:
+                log_error("移到回收站失败: %r" % ex)
+            finally:
+                pythoncom.CoUninitialize()
+            self.monitor.poke()
+        threading.Thread(target=run, daemon=True).start()
+
+    def empty_recycle_bin(self):
+        def run():
+            try:
+                shell.SHEmptyRecycleBin(0, None, 0)      # 0 = 照常弹出 Windows 的确认框
+            except Exception:
+                pass                                      # 用户在确认框点了“否”也会走到这里
+            self.monitor.poke()
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_recycle_state(self, full):
+        changed = False
+        for it in self.items:
+            if it.is_recycle and it.recycle_full != full:
+                it.recycle_full = full
+                img = extract_icon(IMAGERES, -54 if full else -55)
+                if img is not None:
+                    it.image = shrink_icon(img)
+                    it._mips, it._shadow, it._reflection = {}, None, None
+                changed = True
+        if changed:
+            self.update()
 
     def add_paths(self, paths, index=None):
         existing = {os.path.normcase(it.path) for it in self.items}
@@ -2097,10 +2274,10 @@ class Dock(QWidget):
                     r = ctypes.windll.shell32.ShellExecuteW(None, "runas", path, args or None, cwd, 1)
                     if r <= 32 and r != 5:      # 5 = 用户取消了 UAC
                         raise OSError("ShellExecute 错误码 %d" % r)
-                elif not is_web_url(path) and not os.path.exists(path):
+                elif not is_web_url(path) and not is_shell_path(path) and not os.path.exists(path):
                     raise FileNotFoundError("文件不存在：" + path)
                 else:
-                    os.startfile(path, arguments=args, cwd=cwd)
+                    os.startfile(launch_target(path), arguments=args, cwd=cwd)
             except Exception as ex:
                 self.launch_failed.emit(name, str(ex))
             finally:
@@ -2138,10 +2315,13 @@ class Dock(QWidget):
             if item.target or item.path.lower().endswith((".exe", ".lnk", ".bat", ".cmd")):
                 m.addAction("以管理员身份运行", lambda: self.launch(item, admin=True))
             loc = m.addAction("打开文件所在位置", lambda: self.open_location(item))
-            loc.setEnabled(not is_web_url(item.path))
+            loc.setEnabled(not is_web_url(item.path) and not is_shell_path(item.path))
             if item.running:
                 m.addAction("关闭窗口" if len(item.hwnds) == 1 else "关闭全部 %d 个窗口" % len(item.hwnds),
                             lambda: self.close_windows(item))
+            if item.is_recycle:
+                empty = m.addAction("清空回收站", self.empty_recycle_bin)
+                empty.setEnabled(item.recycle_full)
             m.addSeparator()
             if item.pinned:
                 m.addAction("重命名…", lambda: self.rename(item))
@@ -2151,6 +2331,12 @@ class Dock(QWidget):
             m.addSeparator()
         m.addAction("添加程序 / 文件…", self.add_file_dialog)
         m.addAction("添加文件夹…", self.add_folder_dialog)
+        sysm = m.addMenu("添加系统项目")
+        sysm.setStyleSheet(MENU_QSS)
+        have = {os.path.normcase(it.path) for it in self.items}
+        for title, path in SYSTEM_ITEMS:
+            a = sysm.addAction(title, lambda p=path: self.add_paths([p]))
+            a.setEnabled(os.path.normcase(path) not in have)
         self.build_settings_menu(m.addMenu("设置"))
         m.addSeparator()
         m.addAction("隐藏 Dock（托盘可恢复）", lambda: self.set_user_hidden(True))
