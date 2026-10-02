@@ -102,6 +102,7 @@ DEFAULT_CONFIG = {
     "remind_game": 120,       # 连续全屏（玩游戏 / 看视频）多久提醒休息（分钟），0 = 关
     "show_media": True,       # Dock 右端的“正在播放”
     "show_clock": True,       # Dock 右端的时钟
+    "show_power": True,       # 关机键（锁定 / 睡眠 / 注销 / 重启 / 关机）
     "show_volume": True,      # 音量按钮
     "show_tray_button": True,  # 托盘按钮（隐藏任务栏时才显示）
     "auto_hide": False,
@@ -796,7 +797,8 @@ def restore_shell():
 
 WM_HOTKEY = 0x0312
 HSHELL_WINDOWACTIVATED, HSHELL_RUDEAPPACTIVATED, HSHELL_FLASH = 4, 0x8004, 0x8006
-WIDGET_KINDS = ("media", "volume", "tray", "clock")     # Dock 右端的小组件
+WIDGET_KINDS = ("media", "volume", "tray", "clock", "power")     # Dock 右端的小组件
+WIDGET_GLYPHS = {"volume": "", "tray": "", "power": ""}   # Segoe 图标字体里的字符
 VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP = 0xAD, 0xAE, 0xAF
 WEEKDAYS = "一二三四五六日"
 
@@ -1853,7 +1855,7 @@ class Dock(QWidget):
             f = QFont(icon_font())
             f.setPixelSize(max(12, round(self.B * 0.36)))
             p.setFont(f)
-            p.drawText(rect, Qt.AlignCenter, "" if kind == "volume" else "")
+            p.drawText(rect, Qt.AlignCenter, WIDGET_GLYPHS[kind])
 
     def widget_rect(self, kind):
         slots, bar, _ = self.layout()
@@ -1874,6 +1876,8 @@ class Dock(QWidget):
             app = self.media_app_item()
             text = info["title"] + (" — " + info["artist"] if info["artist"] else "")
             return text + (" · " + app.name if app else "")
+        if kind == "power":
+            return "电源：锁定 / 睡眠 / 注销 / 重启 / 关机"
         return "显示托盘（临时显示任务栏）"
 
     # ---------- 正在播放
@@ -1997,6 +2001,8 @@ class Dock(QWidget):
             press_key(VK_VOLUME_MUTE)
         elif kind == "tray":
             self.peek_taskbar()
+        elif kind == "power":
+            self.show_power_menu()
         elif kind == "clock":
             try:
                 os.startfile("ms-actioncenter:")          # Win11：通知中心 + 日历
@@ -2004,6 +2010,63 @@ class Dock(QWidget):
                 win32api.keybd_event(win32con.VK_LWIN, 0, 0, 0)
                 press_key(ord("N"))
                 win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+    # ---------- 关机键
+
+    def show_power_menu(self):
+        rect = self.widget_rect("power")
+        if rect is None:
+            return
+        m = QMenu()
+        m.setStyleSheet(MENU_QSS)
+        for title, action in (("锁定", "lock"), ("睡眠", "sleep"), (None, None), ("注销", "logoff"),
+                              ("重启", "restart"), ("关机", "shutdown")):
+            if title is None:
+                m.addSeparator()
+            else:
+                m.addAction(title, lambda a=action: self.power_action(a))
+        # 菜单朝屏幕里面弹出（Dock 在底部就往上弹）
+        size = m.sizeHint()
+        edge = {"up": rect.top(), "down": rect.bottom(), "left": rect.left(), "right": rect.right()}[self.inward()]
+        if self.vertical:
+            anchor = self.mapToGlobal(QPointF(edge, rect.center().y()).toPoint())
+        else:
+            anchor = self.mapToGlobal(QPointF(rect.center().x(), edge).toPoint())
+        self.menu_open = True
+        m.exec(place_popup(size.width(), size.height(), anchor, self.inward()).topLeft())
+        m.deleteLater()
+        self.menu_open = False
+        self.check_hover()
+        self.kick()
+
+    def confirm_power(self, name):
+        """注销 / 重启 / 关机会关掉所有程序，先确认一下，免得手滑丢了没保存的东西"""
+        box = QMessageBox(QMessageBox.Question, APP_NAME, "确定要%s吗？\n没保存的内容可能会丢失。" % name,
+                          QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        box.button(QMessageBox.Yes).setText(name)
+        box.button(QMessageBox.No).setText("取消")
+        box.setWindowFlag(Qt.WindowStaysOnTopHint)
+        box.show()
+        box.activateWindow()
+        return box.exec() == QMessageBox.Yes
+
+    def power_action(self, action):
+        names = {"logoff": "注销", "restart": "重启", "shutdown": "关机"}
+        if action in names:
+            if not self.confirm_power(names[action]):
+                return
+            # 系统一关，Dock 来不及走正常退出，先把设置和统计存好
+            self.save_config()
+            self.usage.save()
+            flag = {"logoff": "/l", "restart": "/r", "shutdown": "/s"}[action]
+            args = ["shutdown", flag] if action == "logoff" else ["shutdown", flag, "/t", "0"]
+            subprocess.Popen(args, creationflags=subprocess.CREATE_NO_WINDOW)
+        elif action == "lock":
+            user32.LockWorkStation()
+        elif action == "sleep":
+            self.usage.save()
+            ctypes.windll.powrprof.SetSuspendState(False, False, False)
 
     def peek_taskbar(self):
         """隐藏任务栏时，临时把它显示出来用托盘；鼠标离开任务栏和托盘弹窗 1.5 秒后自动藏回去"""
@@ -2417,7 +2480,7 @@ class Dock(QWidget):
             self._mascot_src = (None, None)   # 换了图（可能同名）要重新读
             self.relayout_window()
             self.update_breath_timer()
-        if key in ("show_clock", "show_volume", "show_tray_button", "show_media", "hide_taskbar"):
+        if key in ("show_clock", "show_volume", "show_tray_button", "show_media", "show_power", "hide_taskbar"):
             self.relayout_window()        # 右端小组件变了，Dock 宽度跟着变
         if key == "position":
             self.update_orient()
@@ -2673,6 +2736,8 @@ class Dock(QWidget):
             kinds.append("tray")      # 任务栏没藏时不需要
         if self.cfg.get("show_clock", True):
             kinds.append("clock")
+        if self.cfg.get("show_power", True):
+            kinds.append("power")
         return kinds
 
     def slot_width(self, kind):
@@ -3591,6 +3656,7 @@ class Dock(QWidget):
         if HAVE_MEDIA:
             sub_option(tray, "显示正在播放", "show_media")
         sub_option(tray, "显示时钟", "show_clock")
+        sub_option(tray, "显示关机键", "show_power")
         sub_option(tray, "显示音量按钮", "show_volume")
         sub_option(tray, "显示托盘按钮（隐藏任务栏时）", "show_tray_button")
 
