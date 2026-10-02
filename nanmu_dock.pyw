@@ -2978,13 +2978,21 @@ class Dock(QWidget):
         p.setFont(font)
         fm = QFontMetricsF(font)
         direction = beside or {"up": "up", "down": "down", "right": "right", "left": "left"}[self.inward()]
-        # 气泡太长放不下（竖着放时窗口窄）就截短
+        need = fm.horizontalAdvance(text) + 20
+        room_right = self.width() - icon_rect.right() - 10
+        room_left = icon_rect.left() - 10
+        if beside and direction in ("left", "right"):
+            # 看板娘的台词：这一侧放不下就换到另一侧（比如她站在最右端、右边没地方）
+            here, there = (room_right, room_left) if direction == "right" else (room_left, room_right)
+            if need > here and there > here:
+                direction = "left" if direction == "right" else "right"
+        # 实在放不下（竖着放时窗口窄）才截短
         room = self.width() - 4
         if direction == "right":
-            room = self.width() - icon_rect.right() - 10
+            room = room_right
         elif direction == "left":
-            room = icon_rect.left() - 10
-        if fm.horizontalAdvance(text) + 20 > room:
+            room = room_left
+        if need > room:
             text = fm.elidedText(text, Qt.ElideRight, max(40, room - 20))
         tw, th = fm.horizontalAdvance(text) + 20, fm.height() + 8
         if direction in ("left", "right"):
