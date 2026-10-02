@@ -55,7 +55,7 @@ import win32process
 import win32com.client
 
 APP_NAME = "楠木 Dock"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 INSTANCE_KEY = "NanmuDock_SingleInstance"
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 CONFIG_PATH = os.path.join(APP_DIR, "dock_config.json")
