@@ -35,7 +35,7 @@ import subprocess
 import winreg
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QSize, QFileInfo, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QPoint, QSize, QFileInfo, QThread, Signal
 from PySide6.QtGui import (QPainter, QColor, QPainterPath, QPixmap, QImage, QIcon, QFont, QKeySequence,
                            QFontMetricsF, QCursor, QPen, QBrush, QLinearGradient, QRadialGradient, QTransform,
                            QActionGroup, QGuiApplication)
@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
     "auto_hide": False,
     "hide_on_fullscreen": True,
     "show_running": True,     # 显示没固定的正在运行的程序
+    "window_preview": "multi",  # 鼠标停在图标上时预览窗口：off / multi（多个窗口时）/ all
     "hide_taskbar": False,
     "hide_desktop_icons": False,
     "hotkeys": {},            # 全局快捷键 {功能: 组合键}，见 HOTKEY_ACTIONS，留空 = 不用
@@ -359,6 +360,27 @@ def find_owner(key, hwnd, pinned):
     return None
 
 
+def find_app_root(key, path, hwnd):
+    """窗口属于某个程序在自己安装目录里启动的子组件时（WeGame 的 browser.exe），
+    返回主程序 (规范路径, 原始路径)，这样 Dock 上显示的是 WeGame 本体；否则原样返回"""
+    if "\\steamapps\\" in key:
+        return key, path
+    procs = parent_map()
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+    root, root_path = key, path
+    for _ in range(3):
+        ppid, _ = procs.get(pid, (0, ""))
+        if not ppid or ppid == pid or ppid not in procs or procs[ppid][1] in LAUNCHER_PARENTS:
+            break
+        parent_path = process_path(ppid) or ""
+        parent, pdir = os.path.normcase(parent_path), os.path.dirname(os.path.normcase(parent_path))
+        folder = os.path.dirname(root)
+        if not parent_path or pdir in SHARED_DIRS or not (folder == pdir or folder.startswith(pdir + "\\")):
+            break
+        root, root_path, pid = parent, parent_path, ppid
+    return root, root_path
+
+
 def resolve_exe(path):
     """快捷方式 / 程序最终指向的 exe（规范化），用来和正在运行的窗口对应；其他类型返回 None"""
     ext = os.path.splitext(path)[1].lower()
@@ -455,10 +477,17 @@ def enum_app_windows():
     return result
 
 
+def minimize_window(hwnd):
+    # 用“标题栏最小化按钮”的系统命令：有些程序（WeGame 等 CEF 窗口）不理 ShowWindow
+    win32gui.PostMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_MINIMIZE, 0)
+
+
 def focus_window(hwnd):
     try:
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            if win32gui.IsIconic(hwnd):     # 不理 ShowWindow 的程序，改发“还原按钮”的系统命令
+                win32gui.PostMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE, 0)
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
         # 前台锁定时，模拟一次 Alt 解锁再试
@@ -1058,6 +1087,10 @@ class Dock(QWidget):
         self._seen_apps = None        # {exe: 最后一次看到它有窗口的时间}，用来判断“新打开”
         self._last_state = None
         self._owner_sig, self._owners = None, {}   # 运行中程序 → 所属固定项 的缓存
+        self._roots = {}              # 运行中程序 → (主程序规范路径, 原始路径) 的缓存
+        self.preview = WindowPreview(self)
+        self._preview_item = None     # 鼠标正停在哪个图标上（用来决定弹哪个预览）
+        self.preview_timer = QTimer(self, singleShot=True, interval=400, timeout=self.show_preview)
         self._open_apps = {}          # {exe: 显示名}，当前开着窗口的程序
         self._gone_since = {}         # {exe: 窗口消失的时间}，用来确认是真的关了
         self._say_queue = []
@@ -1476,7 +1509,8 @@ class Dock(QWidget):
         self._last_tick = now
         k = min(1.0, dt * 14)
 
-        active = self.hovered or self.dragging or self.ext_drag
+        # 预览弹窗开着时保持放大，图标不会从弹窗下面“缩走”
+        active = self.hovered or self.dragging or self.ext_drag or self.preview.isVisible()
         dragging_out = self.dragging and self.mouse_pos is not None and self.in_remove_zone(self.mouse_pos)
         target_h = 1.0 if active and not dragging_out else 0.0
         self.hover_amt += (target_h - self.hover_amt) * k
@@ -1507,6 +1541,7 @@ class Dock(QWidget):
         else:
             self.hover_check.stop()
             self.hide_after = time.monotonic() + 0.6
+            self.update_preview_target(None)
         self.kick()
 
     def check_hover(self):
@@ -1519,6 +1554,7 @@ class Dock(QWidget):
             if self.mouse_pos != pos:
                 self.mouse_pos = pos
                 self.update()
+            self.update_preview_target(self.item_at(pos))
         else:
             self.set_hovered(False)
 
@@ -1580,7 +1616,7 @@ class Dock(QWidget):
                     outer = "left" if self.cfg.get("mascot_side") == "left" else "right"
                     self.draw_label(p, self.mascot_line, mrect, beside=outer)
 
-            if hovered_item and self.hover_amt > 0.5:
+            if hovered_item and self.hover_amt > 0.5 and not self.preview.isVisible():
                 self.draw_label(p, hovered_item[0].name, hovered_item[1])
 
         # 正在拖动的图标
@@ -1641,15 +1677,20 @@ class Dock(QWidget):
                 and (e.buttons() & Qt.LeftButton) and (pos - self.press_pos).manhattanLength() > 6):
             self.dragging = True
             self.drag_idx = self.items.index(self.press_item)
+            self.preview.hide()
         if self.dragging:
             self.drop_idx = None if self.in_remove_zone(pos) else self.calc_drop_idx(pos.x())
         else:
             _, bar, zone = self.layout()
             self.set_hovered(bar.contains(pos) or (self.hovered and zone.contains(pos)))
+            if self.hovered:
+                self.update_preview_target(self.item_at(pos))
         self.kick()
 
     def mousePressEvent(self, e):
         pos = e.position()
+        self.preview_timer.stop()
+        self.preview.hide()
         mrect = self.mascot_rect(self.layout()[1])
         if e.button() == Qt.LeftButton and mrect is not None and mrect.contains(pos):
             self.poke_mascot()
@@ -1753,20 +1794,30 @@ class Dock(QWidget):
         for it in pinned.values():
             it.hwnds = []
         owner_names = {}
+        running_groups = {}               # 主程序 → [原始路径, 窗口]
         for key, path, hwnds in groups:
             owner = self.owner_of(key, hwnds[0], pinned)
             if owner is not None:
                 owner.hwnds = owner.hwnds + hwnds
                 owner_names[key] = owner.name
             elif self.cfg["show_running"]:
-                it = old_running.get(key)
-                if it is None:
-                    image = extract_icon(path)
-                    if image is None:
-                        image = window_icon(hwnds[0])
-                    it = DockItem(path, pinned=False, image=image)
-                it.hwnds = hwnds
-                new_running.append(it)
+                if key not in self._roots:
+                    self._roots[key] = find_app_root(key, path, hwnds[0])
+                root, root_path = self._roots[key]
+                running_groups.setdefault(root, [root_path, []])[1].extend(hwnds)
+        for root, (root_path, hwnds) in running_groups.items():
+            it = old_running.get(root)
+            if it is None:
+                image = extract_icon(root_path)
+                if image is None:
+                    image = window_icon(hwnds[0])
+                it = DockItem(root_path, pinned=False, image=image)
+                it.target = root
+            it.hwnds = hwnds
+            new_running.append(it)
+            for key, (r, _) in self._roots.items():
+                if r == root:
+                    owner_names[key] = it.name
         # 已有的保持原来顺序，新开的排到最后
         order = {it.target: i for i, it in enumerate(self.running_items)}
         new_running.sort(key=lambda it: order.get(it.target, len(order)))
@@ -1808,15 +1859,63 @@ class Dock(QWidget):
         self.announce(opened, "mascot_announce", "mascot_open_lines", "打开了 {name}。")
         self.announce(closed, "mascot_announce_close", "mascot_close_lines", "{name}……关掉了。")
 
-    def activate(self, item):
+    def windows_of(self, item):
+        """这个图标名下的所有窗口（按 Z 序）"""
+        if not item.target:
+            return []
         pinned = {it.target: it for it in self.items if it.target}
-        wins = [h for h, key, _ in enum_app_windows()
-                if item.target and (key == item.target or self.owner_of(key, h, pinned) is item)]
+        wins = []
+        for h, key, _ in enum_app_windows():
+            if key == item.target or self._roots.get(key, (None,))[0] == item.target \
+                    or (item.pinned and self.owner_of(key, h, pinned) is item):
+                wins.append(h)
+        return wins
+
+    # ---------- 窗口预览
+
+    def preview_wanted(self, item):
+        mode = self.cfg.get("window_preview", "multi")
+        if item is None or mode == "off" or not item.running:
+            return False
+        return mode == "all" or len(item.hwnds) >= 2
+
+    def update_preview_target(self, item):
+        if item is self._preview_item:
+            return
+        self._preview_item = item
+        if not self.preview_wanted(item):
+            self.preview_timer.stop()
+            if self.preview.isVisible():
+                self.preview.hide_timer.start()
+        elif self.preview.isVisible():
+            self.show_preview()           # 已经开着预览，换个图标就立刻切过去
+        else:
+            self.preview_timer.start()
+
+    def show_preview(self):
+        item = self._preview_item
+        if not self.preview_wanted(item) or self.dragging or self.menu_open:
+            return
+        hwnds = self.windows_of(item)
+        if not hwnds or (self.cfg.get("window_preview", "multi") == "multi" and len(hwnds) < 2):
+            return
+        slots, bar, _ = self.layout()
+        for kind, it, x, w in slots:
+            if it is item:
+                top = icon_base_y(self.theme, bar, self.pad) - w - 8
+                g = self.mapToGlobal(QPoint(int(x + w / 2), int(top)))
+                self.preview.show_for(item, hwnds, g.x(), g.y())
+                self.kick()
+                return
+
+    def activate(self, item):
+        self.preview.hide()
+        wins = self.windows_of(item)
         if wins:
             fg = win32gui.GetForegroundWindow()
             if fg in wins:
                 if len(wins) == 1:
-                    win32gui.ShowWindow(fg, win32con.SW_MINIMIZE)
+                    minimize_window(fg)
                     return
                 focus_window(wins[(wins.index(fg) + 1) % len(wins)])
             else:
@@ -1869,6 +1968,7 @@ class Dock(QWidget):
 
     def show_menu(self, gpos, item):
         self.menu_open = True
+        self.preview.hide()
         m = QMenu()
         m.setStyleSheet(MENU_QSS)
         if item is not None:
@@ -1933,6 +2033,7 @@ class Dock(QWidget):
         sm.addAction("皮肤中心…", self.open_skin_center)
         sm.addSeparator()
         option("显示正在运行的程序", "show_running")
+        radio("窗口预览", "window_preview", [("关闭", "off"), ("有多个窗口时", "multi"), ("总是", "all")])
         option("隐藏 Windows 任务栏", "hide_taskbar")
         hk = self.cfg["hotkeys"].get("desktop_icons")
         option("隐藏桌面图标" + ("\t" + hk if hk else ""), "hide_desktop_icons")
@@ -2001,6 +2102,7 @@ class Dock(QWidget):
             self.show()
         elif not should_show and self.isVisible():
             self.hide()
+            self.preview.hide()
 
     def check_fullscreen(self):
         fs = False
@@ -2036,6 +2138,199 @@ class Dock(QWidget):
         self.monitor.requestInterruption()
         self.monitor.poke()
         self.monitor.wait(3000)
+
+
+# ---------------------------------------------------------------- 窗口预览（DWM 实时缩略图）
+
+class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
+    _fields_ = [("dwFlags", wintypes.DWORD), ("rcDestination", wintypes.RECT), ("rcSource", wintypes.RECT),
+                ("opacity", ctypes.c_ubyte), ("fVisible", wintypes.BOOL), ("fSourceClientAreaOnly", wintypes.BOOL)]
+
+
+dwmapi.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(ctypes.c_void_p)]
+dwmapi.DwmUnregisterThumbnail.argtypes = [ctypes.c_void_p]
+dwmapi.DwmUpdateThumbnailProperties.argtypes = [ctypes.c_void_p, ctypes.POINTER(DWM_THUMBNAIL_PROPERTIES)]
+dwmapi.DwmQueryThumbnailSourceSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.SIZE)]
+DWM_TNP_RECTDESTINATION, DWM_TNP_OPACITY, DWM_TNP_VISIBLE, DWM_TNP_SOURCECLIENTAREAONLY = 0x1, 0x4, 0x8, 0x10
+
+
+class WindowPreview(QWidget):
+    """鼠标停在有多个窗口的图标上时，弹出各窗口的实时缩略图，点哪个切到哪个"""
+    CARD_W, THUMB_H, TITLE_H, PAD, GAP = 240, 150, 32, 10, 8
+
+    def __init__(self, dock):
+        # 不能用半透明窗口：DWM 缩略图画不到分层窗口上
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setMouseTracking(True)
+        self.dock = dock
+        self.item = None
+        self.cards = []           # [{hwnd, title, rect, thumb_rect, close_rect, thumb}]
+        self.hover_idx = None
+        self.hover_close = False
+        self.hide_timer = QTimer(self, singleShot=True, interval=300, timeout=self.maybe_hide)
+
+    def show_for(self, item, hwnds, anchor_x, bottom_y):
+        """anchor_x / bottom_y 是全局坐标：弹窗水平居中于图标、底边贴在图标上方"""
+        self.clear_thumbs()
+        self.item = item
+        n = len(hwnds)
+        scr = (QGuiApplication.screenAt(QPoint(anchor_x, bottom_y)) or QGuiApplication.primaryScreen()).geometry()
+        card_w = min(self.CARD_W, (scr.width() - 2 * self.PAD - (n - 1) * self.GAP - 20) / n)
+        thumb_h = card_w * self.THUMB_H / self.CARD_W
+        w = int(2 * self.PAD + n * card_w + (n - 1) * self.GAP)
+        h = int(2 * self.PAD + self.TITLE_H + thumb_h)
+        x = min(max(anchor_x - w // 2, scr.left() + 6), scr.right() - w - 6)
+        self.setGeometry(x, bottom_y - h, w, h)
+        self.cards = []
+        for i, hwnd in enumerate(hwnds):
+            rect = QRectF(self.PAD + i * (card_w + self.GAP), self.PAD, card_w, self.TITLE_H + thumb_h)
+            self.cards.append(dict(
+                hwnd=hwnd, title=win32gui.GetWindowText(hwnd) or item.name, rect=rect, thumb=None,
+                thumb_rect=rect.adjusted(6, self.TITLE_H, -6, -6),
+                close_rect=QRectF(rect.right() - 28, rect.top() + 5, 22, 22)))
+        self.hover_idx, self.hover_close = None, False
+        self.hide_timer.stop()
+        self.show()
+        self.raise_()
+        self.register_thumbs()
+        self.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        hwnd = int(self.winId())
+        ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex | WS_EX_NOACTIVATE)
+        corner = ctypes.c_int(2)          # Win11 圆角（DWMWA_WINDOW_CORNER_PREFERENCE = 33，ROUND = 2）
+        dwmapi.DwmSetWindowAttribute(wintypes.HWND(hwnd), 33, ctypes.byref(corner), ctypes.sizeof(corner))
+
+    def hideEvent(self, e):
+        self.clear_thumbs()
+        super().hideEvent(e)
+        self.dock.kick()
+
+    def register_thumbs(self):
+        dest, dpr = int(self.winId()), self.devicePixelRatioF()
+        for c in self.cards:
+            thumb = ctypes.c_void_p()
+            if dwmapi.DwmRegisterThumbnail(dest, c["hwnd"], ctypes.byref(thumb)) != 0 or not thumb.value:
+                continue
+            c["thumb"] = thumb
+            size = wintypes.SIZE()
+            dwmapi.DwmQueryThumbnailSourceSize(thumb, ctypes.byref(size))
+            r = c["thumb_rect"]
+            if size.cx <= 0 or size.cy <= 0:
+                continue
+            scale = min(r.width() / size.cx, r.height() / size.cy)
+            tw, th = size.cx * scale, size.cy * scale
+            dst = QRectF(r.center().x() - tw / 2, r.center().y() - th / 2, tw, th)
+            props = DWM_THUMBNAIL_PROPERTIES()
+            props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY
+            props.rcDestination = wintypes.RECT(round(dst.left() * dpr), round(dst.top() * dpr),
+                                                round(dst.right() * dpr), round(dst.bottom() * dpr))
+            props.opacity = 255
+            props.fVisible = True
+            props.fSourceClientAreaOnly = False
+            dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props))
+
+    def clear_thumbs(self):
+        for c in self.cards:
+            if c.get("thumb"):
+                dwmapi.DwmUnregisterThumbnail(c["thumb"])
+                c["thumb"] = None
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        p.fillRect(self.rect(), QColor(30, 30, 35))
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.drawRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5))
+        font = QFont("Microsoft YaHei UI")
+        font.setPixelSize(13)
+        p.setFont(font)
+        fm = QFontMetricsF(font)
+        icon = self.item.pixmap_for(18 * self.devicePixelRatioF()) if self.item else None
+        for i, c in enumerate(self.cards):
+            r = c["rect"]
+            hovered = i == self.hover_idx
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 26) if hovered else QColor(255, 255, 255, 8))
+            p.drawRoundedRect(r, 8, 8)
+            if icon is not None:
+                p.drawPixmap(QRectF(r.left() + 8, r.top() + 7, 18, 18), icon, QRectF(icon.rect()))
+            title_w = r.width() - 40 - (28 if hovered else 6)
+            p.setPen(QColor(235, 235, 240))
+            p.drawText(QRectF(r.left() + 32, r.top(), title_w, self.TITLE_H), Qt.AlignVCenter | Qt.AlignLeft,
+                       fm.elidedText(c["title"], Qt.ElideRight, title_w))
+            # 缩略图底板：最小化的窗口 DWM 不给画面，就显示一个大图标
+            tr = c["thumb_rect"]
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 70))
+            p.drawRoundedRect(tr, 6, 6)
+            if self.item is not None:
+                big = self.item.pixmap_for(48 * self.devicePixelRatioF())
+                p.setOpacity(0.5)
+                p.drawPixmap(QRectF(tr.center().x() - 24, tr.center().y() - 24, 48, 48), big, QRectF(big.rect()))
+                p.setOpacity(1.0)
+            if hovered:
+                cr = c["close_rect"]
+                p.setBrush(QColor(196, 43, 28) if self.hover_close else QColor(255, 255, 255, 30))
+                p.drawRoundedRect(cr, 5, 5)
+                p.setPen(QPen(QColor(255, 255, 255), 1.6))
+                m = 7
+                p.drawLine(QPointF(cr.left() + m, cr.top() + m), QPointF(cr.right() - m, cr.bottom() - m))
+                p.drawLine(QPointF(cr.right() - m, cr.top() + m), QPointF(cr.left() + m, cr.bottom() - m))
+        p.end()
+
+    def card_at(self, pos):
+        for i, c in enumerate(self.cards):
+            if c["rect"].contains(pos):
+                return i, c["close_rect"].contains(pos)
+        return None, False
+
+    def mouseMoveEvent(self, e):
+        idx, close = self.card_at(e.position())
+        if (idx, close) != (self.hover_idx, self.hover_close):
+            self.hover_idx, self.hover_close = idx, close
+            self.update()
+
+    def enterEvent(self, _):
+        self.hide_timer.stop()
+
+    def leaveEvent(self, _):
+        self.hover_idx = None
+        self.update()
+        self.hide_timer.start()
+
+    def mousePressEvent(self, e):
+        idx, close = self.card_at(e.position())
+        if idx is None:
+            return
+        hwnd = self.cards[idx]["hwnd"]
+        if e.button() == Qt.MiddleButton or (e.button() == Qt.LeftButton and close):
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            QTimer.singleShot(600, self.refresh)
+        elif e.button() == Qt.LeftButton:
+            self.hide()
+            focus_window(hwnd)
+
+    def refresh(self):
+        """关掉一个窗口后重新排一下"""
+        if not self.isVisible() or self.item is None:
+            return
+        hwnds = self.dock.windows_of(self.item)
+        if not hwnds:
+            self.hide()
+            return
+        geo = self.geometry()
+        self.show_for(self.item, hwnds, geo.center().x(), geo.bottom() + 1)
+
+    def maybe_hide(self):
+        if self.geometry().contains(QCursor.pos()):
+            return
+        if self.dock.hovered and self.dock._preview_item is self.item:
+            return
+        self.hide()
 
 
 # ---------------------------------------------------------------- 皮肤中心
