@@ -274,7 +274,89 @@ def display_name(path):
 
 
 def norm(path):
-    return os.path.normcase(os.path.abspath(path))
+    # realpath：软件被“搬家”工具挪走后，原位置会留一个目录链接，运行时 Windows 报的是真实位置
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except OSError:
+        return os.path.normcase(os.path.abspath(path))
+
+
+def _env_dir(var, *sub):
+    base = os.environ.get(var)
+    return norm(os.path.join(base, *sub)) if base else None
+
+
+# 很多程序共用的目录：不能因为“装在同一个文件夹”就认定是同一个软件
+SHARED_DIRS = {d for d in (
+    _env_dir("WINDIR"), _env_dir("WINDIR", "System32"), _env_dir("WINDIR", "SysWOW64"),
+    _env_dir("ProgramFiles"), _env_dir("ProgramFiles(x86)"), _env_dir("ProgramData"),
+    _env_dir("LOCALAPPDATA"), _env_dir("LOCALAPPDATA", "Programs"), _env_dir("APPDATA"),
+) if d}
+# 这些父进程只是“帮忙启动”，不代表子进程属于它
+LAUNCHER_PARENTS = {"explorer.exe", "svchost.exe", "services.exe", "sihost.exe", "runtimebroker.exe",
+                    "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe", "python.exe", "pythonw.exe",
+                    "nanmudock.exe", "userinit.exe", "wininit.exe", "winlogon.exe"}
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+
+
+def parent_map():
+    """{pid: (父 pid, 进程名小写)}，只在出现新程序时调用一次"""
+    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)       # TH32CS_SNAPPROCESS
+    result = {}
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return result
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            result[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile.lower())
+            ok = kernel32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        kernel32.CloseHandle(snap)
+    return result
+
+
+def find_owner(key, hwnd, pinned):
+    """运行中的程序（exe 路径 key）对不上任何固定项时，看它是不是某个固定项的“本体”：
+    装在固定项的目录里，并且和启动器在同一个文件夹 / 下一级子文件夹（Oopz、Discord 这类），
+    或者就是由固定项启动的（Steam 的 steamwebhelper）。返回固定项的 target 或 None。"""
+    if "\\steamapps\\" in key:                 # 从 Steam 启动的游戏是独立的软件
+        return None
+    folder = os.path.dirname(key)
+    candidates = {}
+    for target in pinned:
+        tdir = os.path.dirname(target)
+        if tdir not in SHARED_DIRS and (folder == tdir or folder.startswith(tdir + "\\")):
+            candidates[target] = folder == tdir or os.path.dirname(folder) == tdir
+    if not candidates:
+        return None
+    for target, near in candidates.items():
+        if near:
+            return target
+    # 更深的子目录：要求是由这个固定项启动的
+    procs = parent_map()
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+    for _ in range(4):
+        ppid, _ = procs.get(pid, (0, ""))
+        if not ppid or ppid == pid or ppid not in procs or procs[ppid][1] in LAUNCHER_PARENTS:
+            break
+        parent = os.path.normcase(process_path(ppid) or "")
+        if parent in candidates:
+            return parent
+        pid = ppid
+    return None
 
 
 def resolve_exe(path):
@@ -975,6 +1057,7 @@ class Dock(QWidget):
         self.mascot_say_until = 0.0
         self._seen_apps = None        # {exe: 最后一次看到它有窗口的时间}，用来判断“新打开”
         self._last_state = None
+        self._owner_sig, self._owners = None, {}   # 运行中程序 → 所属固定项 的缓存
         self._open_apps = {}          # {exe: 显示名}，当前开着窗口的程序
         self._gone_since = {}         # {exe: 窗口消失的时间}，用来确认是真的关了
         self._say_queue = []
@@ -1250,6 +1333,7 @@ class Dock(QWidget):
         """看板娘报一句“打开了 xxx” / “xxx……关掉了。”"""
         if not names or not self.cfg.get(enabled_key, True) or self.mascot_pixmap() is None:
             return
+        names = list(dict.fromkeys(names))     # 同一个软件的几个进程只报一次
         shown = "、".join(names[:3]) + ("等 %d 个" % len(names) if len(names) > 3 else "")
         templates = [s for s in self.cfg.get(lines_key) or [] if "{name}" in s] or [fallback]
         self.queue_say(random.choice(templates).replace("{name}", shown))
@@ -1651,15 +1735,29 @@ class Dock(QWidget):
 
     # ---------- 正在运行的程序
 
+    def owner_of(self, key, hwnd, pinned):
+        """运行中的程序归哪个固定项（结果缓存，固定项变了就重新算）"""
+        if key in pinned:
+            return pinned[key]
+        sig = tuple(sorted(pinned))
+        if sig != self._owner_sig:
+            self._owner_sig, self._owners = sig, {}
+        if key not in self._owners:
+            self._owners[key] = find_owner(key, hwnd, pinned)
+        return pinned.get(self._owners[key])
+
     def on_windows_update(self, groups):
         pinned = {it.target: it for it in self.items if it.target}
         old_running = {it.target: it for it in self.running_items}
         new_running = []
-        seen = set()
+        for it in pinned.values():
+            it.hwnds = []
+        owner_names = {}
         for key, path, hwnds in groups:
-            seen.add(key)
-            if key in pinned:
-                pinned[key].hwnds = hwnds
+            owner = self.owner_of(key, hwnds[0], pinned)
+            if owner is not None:
+                owner.hwnds = owner.hwnds + hwnds
+                owner_names[key] = owner.name
             elif self.cfg["show_running"]:
                 it = old_running.get(key)
                 if it is None:
@@ -1669,9 +1767,6 @@ class Dock(QWidget):
                     it = DockItem(path, pinned=False, image=image)
                 it.hwnds = hwnds
                 new_running.append(it)
-        for target, it in pinned.items():
-            if target not in seen:
-                it.hwnds = []
         # 已有的保持原来顺序，新开的排到最后
         order = {it.target: i for i, it in enumerate(self.running_items)}
         new_running.sort(key=lambda it: order.get(it.target, len(order)))
@@ -1688,6 +1783,7 @@ class Dock(QWidget):
         now = time.monotonic()
         names = {it.target: it.name for it in new_running}
         names.update({t: it.name for t, it in pinned.items()})
+        names.update(owner_names)
         current = {key: names.get(key) or display_name(path) for key, path, _ in groups}
         if self._seen_apps is None:            # 启动时已经开着的不算“新打开”
             self._seen_apps = dict.fromkeys(current, now)
@@ -1713,7 +1809,9 @@ class Dock(QWidget):
         self.announce(closed, "mascot_announce_close", "mascot_close_lines", "{name}……关掉了。")
 
     def activate(self, item):
-        wins = [h for h, key, _ in enum_app_windows() if item.target and key == item.target]
+        pinned = {it.target: it for it in self.items if it.target}
+        wins = [h for h, key, _ in enum_app_windows()
+                if item.target and (key == item.target or self.owner_of(key, h, pinned) is item)]
         if wins:
             fg = win32gui.GetForegroundWindow()
             if fg in wins:
