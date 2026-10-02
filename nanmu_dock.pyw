@@ -543,18 +543,27 @@ def taskbar_windows():
     return [w for w in wins if w]
 
 
-def desktop_icon_views():
-    views = []
+_icon_views = []
 
-    def cb(h, _):
-        if win32gui.GetClassName(h) in ("Progman", "WorkerW"):
+
+def desktop_icon_views():
+    """桌面图标的列表窗口。只在 Progman / WorkerW 里找（不枚举全部顶层窗口，开的程序多时有上千个），
+    找到后缓存，explorer 重启导致句柄失效时再重新找"""
+    global _icon_views
+    if _icon_views and all(win32gui.IsWindow(h) for h in _icon_views):
+        return _icon_views
+    views = []
+    for cls in ("Progman", "WorkerW"):
+        h = 0
+        while True:
+            h = win32gui.FindWindowEx(0, h, cls, None)
+            if not h:
+                break
             dv = win32gui.FindWindowEx(h, 0, "SHELLDLL_DefView", None)
             lv = dv and win32gui.FindWindowEx(dv, 0, "SysListView32", None)
             if lv:
                 views.append(lv)
-        return True
-
-    win32gui.EnumWindows(cb, None)
+    _icon_views = views
     return views
 
 
