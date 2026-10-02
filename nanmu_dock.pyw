@@ -23,6 +23,7 @@
 import os
 import sys
 import json
+import gc
 import math
 import time
 import random
@@ -35,7 +36,8 @@ import subprocess
 import winreg
 from ctypes import wintypes
 
-from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QPoint, QSize, QFileInfo, QThread, Signal
+from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QPoint, QRect, QSize, QFileInfo, QThread, Signal,
+                            QVariantAnimation)
 from PySide6.QtGui import (QPainter, QColor, QPainterPath, QPixmap, QImage, QIcon, QFont, QKeySequence,
                            QFontMetricsF, QCursor, QPen, QBrush, QLinearGradient, QRadialGradient, QTransform,
                            QActionGroup, QGuiApplication)
@@ -631,8 +633,17 @@ user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 
 # ---------------------------------------------------------------- 数据
 
+ICON_STORE = 128     # 图标原图只留这么大（默认设置下最大显示 ~94px）；Dock.apply_metrics 会按需调大
+
+
+def shrink_icon(img):
+    if max(img.width(), img.height()) > ICON_STORE:
+        img = img.scaled(ICON_STORE, ICON_STORE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+
+
 class DockItem:
-    MIP_SIZES = (48, 96, 160, 256)
+    MIP_SIZES = (48, 96, 128, 160, 256)
 
     def __init__(self, path, name=None, args="", pinned=True, image=None):
         self.path = path
@@ -640,12 +651,21 @@ class DockItem:
         self.args = args
         self.pinned = pinned
         self.target = resolve_exe(path)
-        self.image = image if image is not None else load_icon_image(path)
+        img = image if image is not None else load_icon_image(path)
+        self._full_res = max(img.width(), img.height())     # 原图有多大，调大图标时用来判断要不要重新读
+        self.image = shrink_icon(img)
         self.hwnds = []               # 当前属于它的窗口
         self.bounce_start = -10.0
         self._mips = {}
         self._shadow = None
         self._reflection = None
+
+    def ensure_resolution(self):
+        """图标调大后，存的原图不够清晰就从文件重新读一份"""
+        have = max(self.image.width(), self.image.height())
+        if have < min(ICON_STORE, self._full_res):
+            self.image = shrink_icon(extract_icon(self.path) or load_icon_image(self.path))
+            self._mips, self._shadow, self._reflection = {}, None, None
 
     def _base96(self):
         return self.image.scaled(96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation) \
@@ -684,8 +704,23 @@ class DockItem:
     def running(self):
         return bool(self.hwnds)
 
+    def exact_pixmaps(self, w, dpr):
+        """没被放大的图标尺寸固定：预先缩好图标和投影，每帧直接贴图，省掉现场平滑缩放"""
+        key = ("exact", round(w * dpr))
+        cached = self._mips.get(key)
+        if cached is None:
+            px = round(w * dpr)
+            icon = QPixmap.fromImage(self.image.scaled(px, px, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            icon.setDevicePixelRatio(dpr)
+            sk = round(px * 128 / 96)
+            shadow = self.shadow_pixmap().scaled(sk, sk, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            shadow.setDevicePixelRatio(dpr)
+            cached = self._mips[key] = (icon, shadow)
+        return cached
+
     def pixmap_for(self, px):
         size = next((s for s in self.MIP_SIZES if s >= px), self.MIP_SIZES[-1])
+        size = min(size, max(self.image.width(), self.image.height()))   # 不比存的原图更大
         pm = self._mips.get(size)
         if pm is None:
             pm = QPixmap.fromImage(self.image.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -902,6 +937,30 @@ def paint_decor(p, th, bar, path):
     p.restore()
 
 
+_decor_cache = {}
+
+
+def decor_pixmap(th, w, h, dpr):
+    """装饰图案（星星、樱花、黄瓜片…）每帧画几十个小图形很费，按宽度每 16px 一档缓存成图片"""
+    bucket = int(w // 16)
+    key = (th["name"], th["decor"], th["accent"], bucket, int(h), round(dpr, 2))
+    pm = _decor_cache.get(key)
+    if pm is None:
+        if len(_decor_cache) > 24:
+            _decor_cache.clear()
+        bw = (bucket + 1) * 16
+        pm = QPixmap(max(1, int(bw * dpr)), max(1, int(h * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(0, 0, bw, h)
+        paint_decor(q, th, r, bar_path(th, r))
+        q.end()
+        _decor_cache[key] = pm
+    return pm
+
+
 def paint_background(p, th, bar, image=None):
     if th["bg"] == "none":
         return
@@ -919,16 +978,26 @@ def paint_background(p, th, bar, image=None):
     grad.setColorAt(0, qc(th["bg_top"]))
     grad.setColorAt(1, qc(th["bg_bottom"]))
     p.fillPath(path, grad)
-    paint_decor(p, th, bar, path)
+    if th["decor"]:
+        # 缓存图已经按 Dock 形状裁好，拉伸不到 2%：不再裁边、也不用平滑缩放（这两样每帧都很贵）
+        pm = decor_pixmap(th, bar.width(), bar.height(), p.device().devicePixelRatioF())
+        p.save()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        p.drawPixmap(bar, pm, QRectF(pm.rect()))
+        p.restore()
 
     if th["highlight"]:
+        # 顶部内高光：直接画一条线，不再按形状裁剪（裁剪路径每帧都很贵）
         hl = qc(th["highlight"])
-        p.save()
-        p.setClipPath(path)
+        p.setPen(QPen(hl, 1))
+        y = pr.top() + 1.5
         if th["bg"] == "shelf":
-            p.fillRect(QRectF(pr.left(), pr.bottom() - 3, pr.width(), 3), hl)      # 玻璃台前沿
-        p.strokePath(path.translated(0, 1.2), QPen(hl, 1))
-        p.restore()
+            p.fillRect(QRectF(pr.left() + 2, pr.bottom() - 3, pr.width() - 4, 2), hl)     # 玻璃台前沿
+            inset = pr.height() * 0.8
+            p.drawLine(QPointF(pr.left() + inset + 2, y), QPointF(pr.right() - inset - 2, y))
+        else:
+            r = pr.height() * th["radius"]
+            p.drawLine(QPointF(pr.left() + r * 0.8, y), QPointF(pr.right() - r * 0.8, y))
     if th["border2"]:
         g = QLinearGradient(pr.topLeft(), pr.topRight())
         g.setColorAt(0, qc(th["border"]))
@@ -941,23 +1010,48 @@ def paint_background(p, th, bar, image=None):
     p.restore()
 
 
+_indicator_cache = {}
+
+
+def indicator_sprite(th, B, dpr):
+    """运行指示（圆点 / 短横 / 发光点）画一次缓存成小图，每帧直接贴"""
+    key = (th["indicator"], th["accent"], B, round(dpr, 2))
+    pm = _indicator_cache.get(key)
+    if pm is None:
+        r = max(2.0, B / 22)
+        half = max(B * 0.17, r * 4) + 1          # 小图半宽，够装下发光圈 / 短横
+        size = int(half * 2 + 1)
+        pm = QPixmap(int(size * dpr), int(size * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.Antialiasing)
+        q.setPen(Qt.NoPen)
+        c = QPointF(size / 2, size / 2)
+        if th["indicator"] == "bar":
+            w, h = B * 0.34, max(2.5, B / 17)
+            q.setBrush(qc(th["accent"]))
+            q.drawRoundedRect(QRectF(c.x() - w / 2, c.y() - h / 2, w, h), h / 2, h / 2)
+        else:
+            if th["indicator"] == "glow":
+                g = QRadialGradient(c, r * 4)
+                g.setColorAt(0, qc(th["accent"], 160))
+                g.setColorAt(1, qc(th["accent"], 0))
+                q.setBrush(g)
+                q.drawEllipse(c, r * 4, r * 4)
+            q.setBrush(qc(th["accent"]))
+            q.drawEllipse(c, r, r)
+        q.end()
+        if len(_indicator_cache) > 16:
+            _indicator_cache.clear()
+        _indicator_cache[key] = pm
+    return pm
+
+
 def paint_indicator(p, th, cx, y, B):
-    acc = qc(th["accent"])
-    p.setPen(Qt.NoPen)
-    if th["indicator"] == "bar":
-        w, h = B * 0.34, max(2.5, B / 17)
-        p.setBrush(acc)
-        p.drawRoundedRect(QRectF(cx - w / 2, y - h / 2, w, h), h / 2, h / 2)
-        return
-    r = max(2.0, B / 22)
-    if th["indicator"] == "glow":
-        g = QRadialGradient(QPointF(cx, y), r * 4)
-        g.setColorAt(0, qc(th["accent"], 160))
-        g.setColorAt(1, qc(th["accent"], 0))
-        p.setBrush(g)
-        p.drawEllipse(QPointF(cx, y), r * 4, r * 4)
-    p.setBrush(acc)
-    p.drawEllipse(QPointF(cx, y), r, r)
+    pm = indicator_sprite(th, B, p.device().devicePixelRatioF())
+    half = pm.width() / pm.devicePixelRatio() / 2
+    p.drawPixmap(QPointF(cx - half, y - half), pm)
 
 
 def paint_separator(p, th, cx, bar, pad):
@@ -979,10 +1073,18 @@ def paint_item(p, th, item, rect, base_y, running, hovered, path, ind_y, B, dpr)
         p.setPen(Qt.NoPen)
         p.setBrush(g)
         p.drawEllipse(rect.center(), w * 0.78, w * 0.78)
+    exact = abs(w - B) < 0.01          # 没被放大：贴预先缩好的图，不用现场缩放
+    if exact:
+        icon_pm, shadow_pm = item.exact_pixmaps(w, dpr)
     if th["shadow"]:
-        s = item.shadow_pixmap()
         k = w * 128 / 96
-        p.drawPixmap(QRectF(rect.center().x() - k / 2, rect.center().y() - k / 2 + w * 0.06, k, k), s, QRectF(s.rect()))
+        if exact:
+            p.drawPixmap(QPointF(round(rect.center().x() - k / 2), round(rect.center().y() - k / 2 + w * 0.06)),
+                         shadow_pm)
+        else:
+            s = item.shadow_pixmap()
+            p.drawPixmap(QRectF(rect.center().x() - k / 2, rect.center().y() - k / 2 + w * 0.06, k, k), s,
+                         QRectF(s.rect()))
     if th["reflection"]:
         rp = item.reflection_pixmap()
         p.save()
@@ -991,8 +1093,11 @@ def paint_item(p, th, item, rect, base_y, running, hovered, path, ind_y, B, dpr)
         # 倒影跟弹跳方向相反
         p.drawPixmap(QRectF(rect.left(), 2 * base_y - rect.bottom() + 1, w, w), rp, QRectF(rp.rect()))
         p.restore()
-    pm = item.pixmap_for(w * dpr)
-    p.drawPixmap(rect, pm, QRectF(pm.rect()))
+    if exact:
+        p.drawPixmap(QPointF(round(rect.left()), round(rect.top())), icon_pm)
+    else:
+        pm = item.pixmap_for(w * dpr)
+        p.drawPixmap(rect, pm, QRectF(pm.rect()))
     if running:
         paint_indicator(p, th, rect.center().x(), ind_y, B)
 
@@ -1023,6 +1128,18 @@ def load_config():
     cfg["hotkeys"] = hotkeys
     cfg.pop("hotkey_desktop_icons", None)
     return cfg, first_run
+
+
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.SetProcessWorkingSetSize.argtypes = [wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
+
+
+def trim_memory():
+    """把启动、打开对话框时用过、之后不再需要的内存页还给系统（任务管理器里的“内存”会明显下降）。
+    真要用到时系统会自动换回来，只在空闲时调用"""
+    gc.collect()
+    kernel32.SetProcessWorkingSetSize(kernel32.GetCurrentProcess(), ctypes.c_size_t(-1).value,
+                                      ctypes.c_size_t(-1).value)
 
 
 def write_config(cfg):
@@ -1100,6 +1217,9 @@ class Dock(QWidget):
         self.preview = WindowPreview(self)
         self._preview_item = None     # 鼠标正停在哪个图标上（用来决定弹哪个预览）
         self.preview_timer = QTimer(self, singleShot=True, interval=400, timeout=self.show_preview)
+        QTimer.singleShot(2000, self.preview.warm_up)
+        QTimer.singleShot(10000, trim_memory)      # 启动时加载图标等用过的内存，稳定后还回去
+        self._last_dirty = QRect()    # 上一帧重画的区域（缩小时要把旧内容擦掉）
         self._open_apps = {}          # {exe: 显示名}，当前开着窗口的程序
         self._gone_since = {}         # {exe: 窗口消失的时间}，用来确认是真的关了
         self._say_queue = []
@@ -1222,7 +1342,9 @@ class Dock(QWidget):
         lay.addLayout(buttons)
         dlg.show()
         dlg.activateWindow()
-        if not dlg.exec():
+        accepted = dlg.exec()
+        QTimer.singleShot(1500, trim_memory)
+        if not accepted:
             return
 
         new = {a: e.keySequence().toString(QKeySequence.PortableText) for a, e in edits.items()}
@@ -1259,6 +1381,12 @@ class Dock(QWidget):
         self.pad = round(self.B * 0.2)
         self.sep_w = max(8, round(self.B * 0.22))
         self.bar_h = self.B + 2 * self.pad
+        # 图标最大会显示多大，原图就留多大（多留的只是白占内存）
+        global ICON_STORE
+        dpr = QGuiApplication.primaryScreen().devicePixelRatio()
+        ICON_STORE = 128 if self.B * self.M * dpr <= 128 else 256
+        for it in self.items + self.running_items:
+            it.ensure_resolution()
         self.relayout_window()
 
     def relayout_window(self):
@@ -1276,6 +1404,7 @@ class Dock(QWidget):
         width += 2 * (mascot_w + self.gap * 2)       # Dock 居中，两边都留出看板娘的位置
         width = min(int(width), scr.width())
         self.setGeometry(scr.x() + (scr.width() - width) // 2, scr.y() + scr.height() - height, width, height)
+        self._last_dirty = self.rect()    # 窗口变了，下一帧整个重画
         self.update()
 
     def save_config(self):
@@ -1510,7 +1639,28 @@ class Dock(QWidget):
         if not self.anim.isActive():
             self._last_tick = time.monotonic()
             self.anim.start()
-        self.update()
+        self.update_dock()
+
+    def dirty_rect(self):
+        """这一帧可能变化的区域：Dock 条 + 名称气泡 + 看板娘和她的台词气泡"""
+        if self.dragging or self.ext_drag:
+            return self.rect()            # 拖动的图标会跟着鼠标到处跑
+        _, bar, _ = self.layout()
+        margin = max(self.B, 120)         # 两头图标的名称气泡可能伸出 Dock 条
+        r = QRect(int(bar.left() - margin), 0, int(bar.width() + 2 * margin), self.height())
+        mrect = self.mascot_rect(bar)
+        if mrect is not None:
+            left = self.cfg.get("mascot_side") == "left"
+            extra = 280                   # 台词气泡在外侧
+            r = r.united(QRect(int(mrect.left() - (extra if left else 10)), 0,
+                               int(mrect.width() + extra + 10), self.height()))
+        return r & self.rect()
+
+    def update_dock(self):
+        # 分层窗口每次刷新都要把画面交给 DWM，只更新变化的那块能省不少 CPU / 显卡
+        r = self.dirty_rect()
+        self.update(r.united(self._last_dirty))
+        self._last_dirty = r
 
     def tick(self):
         now = time.monotonic()
@@ -1537,7 +1687,7 @@ class Dock(QWidget):
         bouncing = any(now - it.bounce_start < BOUNCE_TIME for it in self.items + self.running_items) \
             or now - self.mascot_bounce < MASCOT_HOP
         waiting_hide = self.cfg["auto_hide"] and not active and now < self.hide_after
-        self.update()
+        self.update_dock()
         if self.hover_amt == target_h and self.reveal == target_r and not bouncing and not waiting_hide:
             self.anim.stop()
 
@@ -1905,7 +2055,9 @@ class Dock(QWidget):
         item = self._preview_item
         if not self.preview_wanted(item) or self.dragging or self.menu_open:
             return
-        hwnds = self.windows_of(item)
+        # 后台每秒扫描的结果就够用（已是 Z 序），不在鼠标停下的这一刻再枚举一遍全部窗口
+        hwnds = [h for h in item.hwnds if win32gui.IsWindow(h) and win32gui.IsWindowVisible(h)] \
+            or self.windows_of(item)
         if not hwnds or (self.cfg.get("window_preview", "multi") == "multi" and len(hwnds) < 2):
             return
         slots, bar, _ = self.layout()
@@ -2004,9 +2156,11 @@ class Dock(QWidget):
         m.addAction("隐藏 Dock（托盘可恢复）", lambda: self.set_user_hidden(True))
         m.addAction("退出", QApplication.quit)
         m.exec(gpos)
+        m.deleteLater()
         self.menu_open = False
         self.check_hover()
         self.kick()
+        QTimer.singleShot(1500, trim_memory)      # 菜单里可能开过对话框，用完的内存还回去
 
     def build_settings_menu(self, sm):
         sm.setStyleSheet(MENU_QSS)
@@ -2057,6 +2211,8 @@ class Dock(QWidget):
         dlg.show()
         dlg.activateWindow()
         dlg.exec()
+        dlg.deleteLater()
+        QTimer.singleShot(1500, trim_memory)
 
     def open_location(self, item):
         path = item.path
@@ -2178,9 +2334,58 @@ class WindowPreview(QWidget):
         self.hover_idx = None
         self.hover_close = False
         self.hide_timer = QTimer(self, singleShot=True, interval=300, timeout=self.maybe_hide)
+        # 淡入淡出（整窗透明度，DWM 缩略图会跟着一起淡）
+        self.fade = QVariantAnimation(self, duration=120)
+        self.fade.valueChanged.connect(lambda v: self.setWindowOpacity(v))
+        self.fade.finished.connect(self._fade_done)
+        self._fading_out = False
+
+    def warm_up(self):
+        """启动后在屏幕外先显示一次：第一次弹出时就不用现场创建原生窗口、设置 DWM 属性"""
+        if self.isVisible():
+            return
+        self.setWindowOpacity(0)
+        self.setGeometry(-20000, -20000, 200, 120)
+        self.show()
+        self.repaint()                    # 不在屏幕上 Qt 不会自己画，强制画一次
+        super().hide()
+        # 字体引擎第一次画中文要初始化，也提前做掉
+        pm = QPixmap(240, 32)
+        pm.fill(Qt.transparent)
+        q = QPainter(pm)
+        font = QFont("Microsoft YaHei UI")
+        font.setPixelSize(13)
+        q.setFont(font)
+        q.drawText(4, 22, "文件资源管理器 哔哩 - Chrome 微信 QQ…")
+        q.end()
+
+    def _fade_to(self, value, out=False):
+        self._fading_out = out
+        self.fade.stop()
+        self.fade.setStartValue(self.windowOpacity())
+        self.fade.setEndValue(value)
+        self.fade.start()
+
+    def _fade_done(self):
+        if self._fading_out:
+            self._fading_out = False
+            super().hide()
+
+    def fade_out(self):
+        if self.isVisible() and not self._fading_out:
+            self._fade_to(0.0, out=True)
+
+    def hide(self):
+        """立即关闭（点击切换窗口、拖动图标、右键菜单时）"""
+        self.fade.stop()
+        self._fading_out = False
+        super().hide()
 
     def show_for(self, item, hwnds, anchor_x, bottom_y):
         """anchor_x / bottom_y 是全局坐标：弹窗水平居中于图标、底边贴在图标上方"""
+        if self.isVisible() and not self._fading_out and item is self.item \
+                and [c["hwnd"] for c in self.cards] == list(hwnds):
+            return                         # 同一个图标、同一组窗口：不用重建
         self.clear_thumbs()
         self.item = item
         n = len(hwnds)
@@ -2200,10 +2405,15 @@ class WindowPreview(QWidget):
                 close_rect=QRectF(rect.right() - 28, rect.top() + 5, 22, 22)))
         self.hover_idx, self.hover_close = None, False
         self.hide_timer.stop()
+        appearing = not self.isVisible() or self._fading_out
+        if not self.isVisible():
+            self.setWindowOpacity(0)
         self.show()
         self.raise_()
         self.register_thumbs()
         self.update()
+        if appearing:
+            self._fade_to(1.0)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -2339,7 +2549,7 @@ class WindowPreview(QWidget):
             return
         if self.dock.hovered and self.dock._preview_item is self.item:
             return
-        self.hide()
+        self.fade_out()
 
 
 # ---------------------------------------------------------------- 皮肤中心
