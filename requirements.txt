@@ -1,2 +1,8 @@
 PySide6>=6.5
 pywin32>=305
+# “正在播放”用的 Windows 媒体接口（不装也能运行，只是没有这个功能）
+winrt-runtime
+winrt-Windows.Media.Control
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
+winrt-Windows.Storage.Streams

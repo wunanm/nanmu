@@ -20,6 +20,7 @@ subprocess.check_call([
     sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
     "--name", NAME, "--icon", os.path.join("assets", "icon.ico"),
     "--add-data", "%s;assets" % os.path.join("assets", "mascot_default.png"),
+    "--collect-submodules", "winrt",            # “正在播放”用到的 Windows 媒体接口
     "nanmu_dock.pyw",
 ], cwd=ROOT)
 

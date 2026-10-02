@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import gc
+import re
 import math
 import time
 import random
@@ -36,7 +37,7 @@ import subprocess
 import winreg
 from ctypes import wintypes
 
-from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QPoint, QRect, QSize, QFileInfo, QThread, Signal,
+from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QRect, QSize, QFileInfo, QThread, Signal,
                             QVariantAnimation)
 from PySide6.QtGui import (QPainter, QColor, QPainterPath, QPixmap, QImage, QIcon, QFont, QKeySequence,
                            QFontMetricsF, QCursor, QPen, QBrush, QLinearGradient, QRadialGradient, QTransform,
@@ -55,6 +56,15 @@ import win32process
 import win32com.client
 from win32com.shell import shell, shellcon
 
+# “正在播放”用 Windows 的媒体控制接口（pip install winrt-Windows.Media.Control 等），没装就不显示这个功能
+try:
+    import asyncio
+    from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as MediaManager
+    from winrt.windows.storage.streams import DataReader
+    HAVE_MEDIA = True
+except Exception:
+    HAVE_MEDIA = False
+
 APP_NAME = "楠木 Dock"
 APP_VERSION = "1.3.0"
 INSTANCE_KEY = "NanmuDock_SingleInstance"
@@ -67,6 +77,7 @@ ASSETS_DIR = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "assets")
 BUILTIN_MASCOT = os.path.join(ASSETS_DIR, "mascot_default.png")
 
 DEFAULT_CONFIG = {
+    "position": "bottom",     # Dock 位置：bottom / top / left / right
     "icon_size": 52,          # 图标基础大小（逻辑像素）
     "magnify": 1.8,           # 最大放大倍数，1.0 = 关闭放大
     "spread": 2.6,            # 放大影响范围（以图标个数计）
@@ -89,6 +100,7 @@ DEFAULT_CONFIG = {
     "mascot_greet": True,     # 按时间段问候
     "remind_water": 0,        # 喝水提醒间隔（分钟），0 = 关
     "remind_game": 120,       # 连续全屏（玩游戏 / 看视频）多久提醒休息（分钟），0 = 关
+    "show_media": True,       # Dock 右端的“正在播放”
     "show_clock": True,       # Dock 右端的时钟
     "show_volume": True,      # 音量按钮
     "show_tray_button": True,  # 托盘按钮（隐藏任务栏时才显示）
@@ -637,6 +649,97 @@ class WindowMonitor(QThread):
                 self.msleep(500)
 
 
+class MediaWatcher(QThread):
+    """后台每秒读一次“正在播放”（网易云、QQ 音乐、B 站、浏览器…都会报给 Windows），有变化才通知"""
+    changed = Signal(object)     # None 或 {app, title, artist, playing, thumb(bytes|None)}
+
+    def __init__(self):
+        super().__init__()
+        self.loop = None
+        self.mgr = None
+        self._stop = False
+        self._last = None
+        self._thumb_key = self._thumb = None
+
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self.main())
+        except Exception as e:
+            log_error("读取正在播放失败: %r" % e)
+
+    async def main(self):
+        self.mgr = await MediaManager.request_async()
+        while not self._stop:
+            try:
+                info = await self.read()
+            except Exception:
+                info = None
+            if info != self._last:
+                self._last = info
+                self.changed.emit(info)
+            for _ in range(10):
+                if self._stop:
+                    return
+                await asyncio.sleep(0.1)
+
+    async def read(self):
+        s = self.mgr.get_current_session()
+        if s is None:
+            return None
+        props = await s.try_get_media_properties_async()
+        title = (props.title or "").strip()
+        if not title:
+            return None
+        artist = (props.artist or "").strip()
+        key = (s.source_app_user_model_id, title, artist)
+        if key != self._thumb_key:          # 换歌了才重新读封面
+            self._thumb_key = key
+            self._thumb = await self.read_thumb(props.thumbnail)
+        return {"app": s.source_app_user_model_id or "", "title": title, "artist": artist,
+                "playing": int(s.get_playback_info().playback_status) == 4, "thumb": self._thumb}
+
+    @staticmethod
+    async def read_thumb(ref):
+        if ref is None:
+            return None
+        try:
+            stream = await ref.open_read_async()
+            size = int(stream.size)
+            if not size or size > 8 * 2**20:
+                return None
+            reader = DataReader(stream.get_input_stream_at(0))
+            await reader.load_async(size)
+            return bytes(reader.read_buffer(size))
+        except Exception:
+            return None
+
+    def command(self, name):
+        if self.loop is not None and self.mgr is not None:
+            asyncio.run_coroutine_threadsafe(self._command(name), self.loop)
+
+    async def _command(self, name):
+        s = self.mgr.get_current_session()
+        if s is None:
+            return
+        try:
+            if name == "toggle":
+                await s.try_toggle_play_pause_async()
+            elif name == "next":
+                await s.try_skip_next_async()
+            elif name == "prev":
+                await s.try_skip_previous_async()
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+        self._last = None                     # 马上刷新一次状态
+
+    def stop(self):
+        self._stop = True
+        self.wait(2000)
+
+
 # ---------------------------------------------------------------- 隐藏任务栏 / 桌面图标
 
 def taskbar_windows():
@@ -693,7 +796,7 @@ def restore_shell():
 
 WM_HOTKEY = 0x0312
 HSHELL_WINDOWACTIVATED, HSHELL_RUDEAPPACTIVATED, HSHELL_FLASH = 4, 0x8004, 0x8006
-WIDGET_KINDS = ("volume", "tray", "clock")     # Dock 右端的小组件
+WIDGET_KINDS = ("media", "volume", "tray", "clock")     # Dock 右端的小组件
 VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP = 0xAD, 0xAE, 0xAF
 WEEKDAYS = "一二三四五六日"
 
@@ -1089,7 +1192,7 @@ def bar_path(th, bar):
         path.lineTo(bar.left(), bar.bottom())
         path.closeSubpath()
     else:
-        r = bar.height() * th["radius"]
+        r = min(bar.width(), bar.height()) * th["radius"]     # 按短边算：竖着放时也是正常圆角
         path.addRoundedRect(bar, r, r)
     return path
 
@@ -1122,6 +1225,11 @@ def paint_decor(p, th, bar, path):
     p.save()
     p.setClipPath(path)
     p.setPen(Qt.NoPen)
+    if bar.height() > bar.width():
+        # 竖着的 Dock：把画布转 90°，装饰照横条的样子画，大小和排布都不变
+        p.translate(bar.left(), bar.bottom())
+        p.rotate(-90)
+        bar = QRectF(0, 0, bar.height(), bar.width())
     w, h = bar.width(), bar.height()
     if d == "stars":
         for fx, fy, r, a in DECOR_STARS:
@@ -1178,19 +1286,23 @@ _decor_cache = {}
 
 def decor_pixmap(th, w, h, dpr):
     """装饰图案（星星、樱花、黄瓜片…）每帧画几十个小图形很费，按宽度每 16px 一档缓存成图片"""
-    bucket = int(w // 16)
-    key = (th["name"], th["decor"], th["accent"], bucket, int(h), round(dpr, 2))
+    # 长边（会随放大变化）按 16px 分档，短边（Dock 厚度）固定
+    vertical = h > w
+    bucket = int((h if vertical else w) // 16)
+    short = int(w if vertical else h)
+    key = (th["name"], th["decor"], th["accent"], bucket, short, vertical, round(dpr, 2))
     pm = _decor_cache.get(key)
     if pm is None:
         if len(_decor_cache) > 24:
             _decor_cache.clear()
-        bw = (bucket + 1) * 16
-        pm = QPixmap(max(1, int(bw * dpr)), max(1, int(h * dpr)))
+        long_side = (bucket + 1) * 16
+        bw, bh = (short, long_side) if vertical else (long_side, short)
+        pm = QPixmap(max(1, int(bw * dpr)), max(1, int(bh * dpr)))
         pm.setDevicePixelRatio(dpr)
         pm.fill(Qt.transparent)
         q = QPainter(pm)
         q.setRenderHint(QPainter.Antialiasing)
-        r = QRectF(0, 0, bw, h)
+        r = QRectF(0, 0, bw, bh)
         paint_decor(q, th, r, bar_path(th, r))
         q.end()
         _decor_cache[key] = pm
@@ -1210,7 +1322,9 @@ def paint_background(p, th, bar, image=None):
         w, h = image.width() * scale, image.height() * scale
         p.drawPixmap(QRectF(pr.center().x() - w / 2, pr.center().y() - h / 2, w, h), image, QRectF(image.rect()))
         p.setClipping(False)
-    grad = QLinearGradient(pr.topLeft(), pr.bottomLeft())
+    vertical = pr.height() > pr.width()
+    # 渐变沿 Dock 的厚度方向（竖着放时是左右方向）
+    grad = QLinearGradient(pr.topLeft(), pr.topRight() if vertical else pr.bottomLeft())
     grad.setColorAt(0, qc(th["bg_top"]))
     grad.setColorAt(1, qc(th["bg_bottom"]))
     p.fillPath(path, grad)
@@ -1231,11 +1345,15 @@ def paint_background(p, th, bar, image=None):
             p.fillRect(QRectF(pr.left() + 2, pr.bottom() - 3, pr.width() - 4, 2), hl)     # 玻璃台前沿
             inset = pr.height() * 0.8
             p.drawLine(QPointF(pr.left() + inset + 2, y), QPointF(pr.right() - inset - 2, y))
+        elif vertical:
+            r = pr.width() * th["radius"]
+            x = pr.left() + 1.5
+            p.drawLine(QPointF(x, pr.top() + r * 0.8), QPointF(x, pr.bottom() - r * 0.8))
         else:
             r = pr.height() * th["radius"]
             p.drawLine(QPointF(pr.left() + r * 0.8, y), QPointF(pr.right() - r * 0.8, y))
     if th["border2"]:
-        g = QLinearGradient(pr.topLeft(), pr.topRight())
+        g = QLinearGradient(pr.topLeft(), pr.bottomLeft() if vertical else pr.topRight())
         g.setColorAt(0, qc(th["border"]))
         g.setColorAt(0.5, qc(th["border2"]))
         g.setColorAt(1, qc(th["border"]))
@@ -1378,6 +1496,70 @@ def trim_memory():
                                       ctypes.c_size_t(-1).value)
 
 
+USAGE_PATH = os.path.join(APP_DIR, "usage.json")
+
+
+def fmt_duration(seconds):
+    m = int(seconds // 60)
+    if m < 1:
+        return "不到 1 分钟"
+    if m < 60:
+        return "%d 分钟" % m
+    return "%d 小时 %d 分" % (m // 60, m % 60) if m % 60 else "%d 小时" % (m // 60)
+
+
+class UsageStats:
+    """每天每个程序在前台用了多久。只存在本机 usage.json，保留最近 35 天"""
+
+    def __init__(self):
+        self.days, self.names = {}, {}
+        try:
+            with open(USAGE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            self.days, self.names = data.get("days", {}), data.get("names", {})
+        except (OSError, ValueError):
+            pass
+        self.dirty = False
+
+    @staticmethod
+    def today_key(offset=0):
+        return time.strftime("%Y-%m-%d", time.localtime(time.time() - offset * 86400))
+
+    def add(self, key, name, seconds):
+        day = self.days.setdefault(self.today_key(), {})
+        day[key] = day.get(key, 0) + seconds
+        if name:
+            self.names[key] = name
+        self.dirty = True
+
+    def today(self, key):
+        return self.days.get(self.today_key(), {}).get(key, 0)
+
+    def totals(self, days=1):
+        """最近 days 天合计：[(key, 秒)] 从多到少"""
+        total = {}
+        for i in range(days):
+            for k, s in self.days.get(self.today_key(i), {}).items():
+                total[k] = total.get(k, 0) + s
+        return sorted(total.items(), key=lambda kv: -kv[1])
+
+    def save(self):
+        if not self.dirty:
+            return
+        keep = {self.today_key(i) for i in range(35)}
+        self.days = {d: v for d, v in self.days.items() if d in keep}
+        used = {k for v in self.days.values() for k in v}
+        self.names = {k: n for k, n in self.names.items() if k in used}
+        tmp = USAGE_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"days": self.days, "names": self.names}, f, ensure_ascii=False)
+            os.replace(tmp, USAGE_PATH)
+            self.dirty = False
+        except OSError as e:
+            log_error("保存使用统计失败: %r" % e)
+
+
 def write_config(cfg):
     tmp = CONFIG_PATH + ".tmp"
     try:
@@ -1496,6 +1678,11 @@ class Dock(QWidget):
         self.game_reminded = 0        # 这次全屏已经提醒过几次
         self.pending_say = None       # 全屏时看不到气泡，攒着等退出全屏再说
         self.greeted = set()          # 今天已经问候过的时段
+        self.usage = UsageStats()
+        self._usage_last = time.monotonic()
+        self.summarized_day = None    # 今晚总结过了没有
+        self.mouse_win = None         # 鼠标的窗口坐标（看板娘的点击 / 拖动、媒体按钮用）
+        self.update_orient()
 
         self.apply_metrics()
 
@@ -1510,6 +1697,14 @@ class Dock(QWidget):
         self.monitor.recycle_state.connect(self.on_recycle_state)
         self.monitor.watch_recycle = lambda: any(it.is_recycle for it in self.pinned_flat())
         self.monitor.start()
+
+        self.media_info = None
+        self._media_thumb = (None, None)          # (封面原始数据, 缩好的图)
+        self.media = None
+        if HAVE_MEDIA:
+            self.media = MediaWatcher()
+            self.media.changed.connect(self.on_media)
+            self.media.start()
 
         self.launch_failed.connect(lambda n, err: self.tray_message("启动失败：" + n, err))
         screen = QGuiApplication.primaryScreen()
@@ -1624,26 +1819,26 @@ class Dock(QWidget):
 
     # ---------- 时钟 / 音量 / 托盘按钮
 
-    def paint_widget(self, p, kind, rect):
+    def paint_widget(self, p, kind, rect, hovered=False):
+        """rect 是窗口坐标；竖着放时 rect 是窄而高的"""
         th = self.theme
         color = qc(th["text"])
-        hovered = (self.mouse_pos is not None and self.hovered and not self.dragging
-                   and rect.left() - self.gap / 2 <= self.mouse_pos.x() < rect.right() + self.gap / 2)
-        if hovered:
+        if hovered and kind != "media":
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(color.red(), color.green(), color.blue(), 32))
-            p.drawRoundedRect(rect.adjusted(1, self.pad * 0.5, -1, -self.pad * 0.5), 8, 8)
+            m = self.pad * 0.5
+            p.drawRoundedRect(rect.adjusted(m, 1, -m, -1) if self.vertical else rect.adjusted(1, m, -1, -m), 8, 8)
         p.setPen(color)
         if kind == "clock":
             now = time.localtime()
             f1 = QFont("Microsoft YaHei UI")
-            f1.setPixelSize(max(12, round(self.B * 0.33)))
+            f1.setPixelSize(max(12, round(self.B * (0.3 if self.vertical else 0.33))))
             f1.setBold(True)
             f2 = QFont("Microsoft YaHei UI")
-            f2.setPixelSize(max(10, round(self.B * 0.2)))
+            f2.setPixelSize(max(10, round(self.B * (0.18 if self.vertical else 0.2))))
             date = "%d/%d 周%s" % (now.tm_mon, now.tm_mday, WEEKDAYS[now.tm_wday])
             bat = battery_percent()
-            if bat is not None:
+            if bat is not None and not self.vertical:
                 date += " %d%%" % bat
             mid = rect.center().y()
             p.setFont(f1)
@@ -1652,11 +1847,20 @@ class Dock(QWidget):
             p.setFont(f2)
             p.drawText(QRectF(rect.left() - 6, mid + self.B * 0.04, rect.width() + 12, self.B * 0.34),
                        Qt.AlignHCenter | Qt.AlignTop, date)
+        elif kind == "media":
+            self.paint_media(p, rect, color, hovered)
         else:
             f = QFont(icon_font())
             f.setPixelSize(max(12, round(self.B * 0.36)))
             p.setFont(f)
             p.drawText(rect, Qt.AlignCenter, "" if kind == "volume" else "")
+
+    def widget_rect(self, kind):
+        slots, bar, _ = self.layout()
+        for k, _, x, w in slots:
+            if k == kind:
+                return self.win_rect(QRectF(x, bar.top(), w, bar.height()))
+        return None
 
     def widget_tip(self, kind):
         if kind == "clock":
@@ -1665,10 +1869,131 @@ class Dock(QWidget):
                                                     WEEKDAYS[now.tm_wday])
         if kind == "volume":
             return "滚轮调音量 · 点击静音"
+        if kind == "media" and self.media_info:
+            info = self.media_info
+            app = self.media_app_item()
+            text = info["title"] + (" — " + info["artist"] if info["artist"] else "")
+            return text + (" · " + app.name if app else "")
         return "显示托盘（临时显示任务栏）"
 
-    def run_widget(self, kind):
-        if kind == "volume":
+    # ---------- 正在播放
+
+    def on_media(self, info):
+        had = bool(self.media_info)
+        self.media_info = info
+        if bool(info) != had:
+            self.relayout_window()        # 出现 / 消失：Dock 长度要变
+        self.update()
+
+    def media_app_item(self):
+        """正在播放的是 Dock 上哪个程序：用播放器报的 ID（如 com.bilibili.bilibiliPC、cloudmusic.exe）去匹配路径"""
+        if not self.media_info:
+            return None
+        aumid = self.media_info["app"].lower()
+        tokens = [t for t in re.split(r"[.!_\\\-\s]+", aumid)
+                  if len(t) >= 4 and t not in ("exe", "desktop", "microsoft", "windows", "com")]
+        for it in self.all_items():
+            if it.target and any(t in it.target for t in tokens):
+                return it
+        return None
+
+    def media_thumb(self):
+        data = self.media_info.get("thumb") if self.media_info else None
+        if data and self._media_thumb[0] is not data:
+            img = QImage.fromData(data)
+            pm = None if img.isNull() else QPixmap.fromImage(img.scaled(128, 128, Qt.KeepAspectRatioByExpanding,
+                                                                         Qt.SmoothTransformation))
+            self._media_thumb = (data, pm)
+        if data and self._media_thumb[1] is not None:
+            return self._media_thumb[1]
+        app = self.media_app_item()
+        return app.pixmap_for(96) if app else None
+
+    def media_parts(self, rect):
+        """正在播放组件里各部分的位置（窗口坐标）"""
+        B, pad = self.B, self.pad
+        if self.vertical:
+            t = min(rect.width() - pad, B * 0.8)
+            thumb = QRectF(rect.center().x() - t / 2, rect.top() + 4, t, t)
+            return {"thumb": thumb, "toggle": QRectF(rect.left(), thumb.bottom() + 2, rect.width(),
+                                                      rect.bottom() - thumb.bottom() - 2)}
+        t = B * 0.8
+        bw = B * 0.44
+        nxt = QRectF(rect.right() - bw, rect.top(), bw, rect.height())
+        tog = nxt.translated(-bw, 0)
+        prv = tog.translated(-bw, 0)
+        thumb = QRectF(rect.left() + pad * 0.3, rect.center().y() - t / 2, t, t)
+        text = QRectF(thumb.right() + 8, rect.top(), prv.left() - thumb.right() - 12, rect.height())
+        return {"thumb": thumb, "text": text, "prev": prv, "toggle": tog, "next": nxt}
+
+    def paint_media(self, p, rect, color, hovered):
+        info = self.media_info
+        if not info:
+            return
+        parts = self.media_parts(rect)
+        mw = getattr(self, "mouse_win", None)
+        tr = parts["thumb"]
+        pm = self.media_thumb()
+        clip = QPainterPath()
+        clip.addRoundedRect(tr, 6, 6)
+        p.save()
+        p.setClipPath(clip)
+        if pm is not None:
+            p.drawPixmap(tr, pm, QRectF(pm.rect()))
+        else:
+            p.fillRect(tr, QColor(color.red(), color.green(), color.blue(), 40))
+            f = QFont(icon_font())
+            f.setPixelSize(round(tr.height() * 0.5))
+            p.setFont(f)
+            p.setPen(color)
+            p.drawText(tr, Qt.AlignCenter, "")       # 音符
+        p.restore()
+        if "text" in parts:
+            r = parts["text"]
+            f1 = QFont("Microsoft YaHei UI")
+            f1.setPixelSize(max(11, round(self.B * 0.23)))
+            f1.setBold(True)
+            f2 = QFont("Microsoft YaHei UI")
+            f2.setPixelSize(max(10, round(self.B * 0.19)))
+            p.setPen(color)
+            p.setFont(f1)
+            p.drawText(QRectF(r.left(), r.top(), r.width(), r.height() / 2 + 2), Qt.AlignLeft | Qt.AlignBottom,
+                       QFontMetricsF(f1).elidedText(info["title"], Qt.ElideRight, r.width()))
+            p.setFont(f2)
+            p.setPen(QColor(color.red(), color.green(), color.blue(), 170))
+            sub = info["artist"] or (self.media_app_item().name if self.media_app_item() else "")
+            p.drawText(QRectF(r.left(), r.center().y() + 3, r.width(), r.height() / 2 - 3), Qt.AlignLeft | Qt.AlignTop,
+                       QFontMetricsF(f2).elidedText(sub, Qt.ElideRight, r.width()))
+        f = QFont(icon_font())
+        f.setPixelSize(max(11, round(self.B * 0.3)))
+        p.setFont(f)
+        glyphs = {"prev": "", "toggle": "" if info["playing"] else "", "next": ""}
+        for name, glyph in glyphs.items():
+            if name not in parts:
+                continue
+            br = parts[name]
+            if hovered and mw is not None and br.contains(mw):
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(color.red(), color.green(), color.blue(), 36))
+                p.drawEllipse(br.center(), min(br.width(), br.height()) * 0.42, min(br.width(), br.height()) * 0.42)
+            p.setPen(color)
+            p.drawText(br, Qt.AlignCenter, glyph)
+
+    def run_widget(self, kind, pos=None):
+        if kind == "media":
+            rect = self.widget_rect("media")
+            if rect is None or self.media is None:
+                return
+            parts = self.media_parts(rect)
+            hit = next((n for n in ("prev", "toggle", "next") if n in parts and pos is not None
+                        and parts[n].contains(pos)), None)
+            if hit:
+                self.media.command(hit)
+            else:
+                app = self.media_app_item()          # 点封面 / 歌名：切到播放器
+                if app is not None:
+                    self.activate(app)
+        elif kind == "volume":
             press_key(VK_VOLUME_MUTE)
         elif kind == "tray":
             self.peek_taskbar()
@@ -1734,14 +2059,10 @@ class Dock(QWidget):
         if self.group_popup.isVisible() and self.group_popup.group is group:
             self.group_popup.hide()
             return
-        slots, bar, _ = self.layout()
-        for kind, it, x, w in slots:
-            if it is group:
-                top = icon_base_y(self.theme, bar, self.pad) - w - 8
-                g = self.mapToGlobal(QPoint(int(x + w / 2), int(top)))
-                self.group_popup.show_for(group, g.x(), g.y())
-                self.kick()
-                return
+        anchor = self.popup_anchor(group)
+        if anchor is not None:
+            self.group_popup.show_for(group, anchor, self.inward())
+            self.kick()
 
     def take_out_of_group(self, group, child):
         """从分组里拿出来，放回 Dock 上分组的后面；分组只剩一个就自动解散"""
@@ -1789,7 +2110,9 @@ class Dock(QWidget):
         self.schedule_minute()
         if self.widget_kinds():
             self.update()                 # 时钟走字
+        self.usage.save()
         self.greet()
+        self.evening_summary()
         mono = time.monotonic()
         idle = idle_seconds()
         # 喝水：人离开电脑超过 5 分钟就重新计时
@@ -1934,38 +2257,136 @@ class Dock(QWidget):
     # ---------- 尺寸 / 配置
 
     def apply_metrics(self):
-        self.B = int(self.cfg["icon_size"])
         self.M = max(1.0, float(self.cfg["magnify"]))
         self.spread = max(1.0, float(self.cfg["spread"]))
-        self.gap = round(self.B * 0.16)
-        self.pad = round(self.B * 0.2)
-        self.sep_w = max(8, round(self.B * 0.22))
-        self.bar_h = self.B + 2 * self.pad
+        self.set_metrics(int(self.cfg["icon_size"]))
         # 图标最大会显示多大，原图就留多大（多留的只是白占内存）
         global ICON_STORE
         dpr = QGuiApplication.primaryScreen().devicePixelRatio()
-        ICON_STORE = 128 if self.B * self.M * dpr <= 128 else 256
+        ICON_STORE = 128 if int(self.cfg["icon_size"]) * self.M * dpr <= 128 else 256
         for it in self.items + self.running_items:
             it.ensure_resolution()
         self.relayout_window()
 
+    def set_metrics(self, B):
+        """图标实际大小（设定值，或者屏幕放不下时自动缩小后的值）及跟着它走的尺寸"""
+        self.B = B
+        self.gap = round(B * 0.16)
+        self.pad = round(B * 0.2)
+        self.sep_w = max(6, round(B * 0.22))
+        self.bar_h = B + 2 * self.pad
+
+    def mascot_len(self):
+        """看板娘沿 Dock 方向占多长（横着放是她的宽度，竖着放是她的身高）"""
+        src = self.mascot_pixmap_raw()
+        if src is None:
+            return 0
+        h = self.B * float(self.cfg.get("mascot_size", 2.6))
+        return h if self.vertical else src.width() / src.height() * h
+
+    def needed_main(self):
+        """按现在的图标、小组件、看板娘，Dock 窗口沿长边需要多长"""
+        slots = self.build_slots(with_gap=False)
+        rest = sum(self.slot_width(k) for k, _ in slots) + self.gap * max(len(slots) - 1, 0)
+        magnify = self.B * (self.M - 1) * self.spread          # 放大时整条会变长这么多
+        return rest + 2 * self.pad + magnify + 2 * (self.mascot_len() + self.gap * 2) + self.B
+
+    # ---------- Dock 位置（底 / 顶 / 左 / 右）
+    # 布局全部按“横着贴在底边”来算（抽象坐标：x 沿着 Dock，y 往屏幕边缘增大），
+    # 画的时候再换算成窗口坐标。图标本身始终正着画，不旋转。
+
+    def update_orient(self):
+        self.orient = self.cfg.get("position", "bottom")
+        if self.orient not in ("bottom", "top", "left", "right"):
+            self.orient = "bottom"
+        self.vertical = self.orient in ("left", "right")
+
+    @property
+    def L(self):
+        """沿着 Dock 方向的窗口长度"""
+        return self.height() if self.vertical else self.width()
+
+    @property
+    def C(self):
+        """垂直于 Dock 方向的窗口长度"""
+        return self.width() if self.vertical else self.height()
+
+    def win_rect(self, r):
+        o, C = self.orient, self.C
+        if o == "bottom":
+            return QRectF(r)
+        if o == "top":
+            return QRectF(r.x(), C - r.y() - r.height(), r.width(), r.height())
+        if o == "left":
+            return QRectF(C - r.y() - r.height(), r.x(), r.height(), r.width())
+        return QRectF(r.y(), r.x(), r.height(), r.width())
+
+    def win_pt(self, pt):
+        o, C = self.orient, self.C
+        if o == "bottom":
+            return QPointF(pt)
+        if o == "top":
+            return QPointF(pt.x(), C - pt.y())
+        if o == "left":
+            return QPointF(C - pt.y(), pt.x())
+        return QPointF(pt.y(), pt.x())
+
+    def abs_pt(self, pt):
+        o, C = self.orient, self.C
+        if o == "bottom":
+            return QPointF(pt)
+        if o == "top":
+            return QPointF(pt.x(), C - pt.y())
+        if o == "left":
+            return QPointF(pt.y(), C - pt.x())
+        return QPointF(pt.y(), pt.x())
+
+    def inward(self):
+        """从屏幕边缘往里的方向：弹窗、名称气泡朝这边放"""
+        return {"bottom": "up", "top": "down", "left": "right", "right": "left"}[self.orient]
+
+    def popup_anchor(self, item):
+        """图标朝里那一侧边缘的中点（全局坐标），弹窗贴在这里"""
+        slots, bar, _ = self.layout()
+        for kind, it, x, w in slots:
+            if it is item:
+                top = icon_base_y(self.paint_theme(), bar, self.pad) - w - 8
+                return self.mapToGlobal(self.win_pt(QPointF(x + w / 2, top)).toPoint())
+        return None
+
     def relayout_window(self):
         screen = QGuiApplication.primaryScreen()
-        # 任务栏被我们藏起来时，系统仍给它留着位置，Dock 直接贴到屏幕最底下占用那块地方
+        # 任务栏被我们藏起来时，系统仍给它留着位置，Dock 直接贴到屏幕边上占用那块地方
         scr = screen.geometry() if self.taskbar_hidden else screen.availableGeometry()
+        avail = scr.height() if self.vertical else scr.width()
+        # 屏幕放不下就按比例缩小图标（竖着放、图标多时常见）；有空间了再长回设定的大小
+        for _ in range(3):
+            target = max(28, min(int(self.cfg["icon_size"]), int(avail * self.B / self.needed_main())))
+            if target == self.B:
+                break
+            self.set_metrics(target)
         B, M = self.B, self.M
-        n = len(self.items) + len(self.running_items) + 3
-        if self.widget_kinds():
-            n += 3                        # 时钟 / 音量 / 托盘按钮大约占 3 个图标宽
         above = max(B * (M - 1) + B * 0.4 + 46, B * 2.1)
-        height = int(MARGIN + self.bar_h + above)
-        self.mascot_h = min(B * float(self.cfg.get("mascot_size", 2.6)), height - MARGIN - 6)
-        mascot = self.mascot_pixmap()
-        mascot_w = mascot.width() / mascot.height() * self.mascot_h if mascot else 0
-        width = n * (B + self.gap) + 2 * self.pad + B * (M - 1) * self.spread * 1.3 + B * 3
-        width += 2 * (mascot_w + self.gap * 2)       # Dock 居中，两边都留出看板娘的位置
-        width = min(int(width), scr.width())
-        self.setGeometry(scr.x() + (scr.width() - width) // 2, scr.y() + scr.height() - height, width, height)
+        cross = int(MARGIN + self.bar_h + above)
+        mascot = self.mascot_pixmap_raw()
+        if self.vertical:
+            # 竖着放时看板娘站在 Dock 的一头，高度不受窗口厚度限制，但窗口要够宽装下她
+            self.mascot_h = B * float(self.cfg.get("mascot_size", 2.6))
+            mascot_w = mascot.width() / mascot.height() * self.mascot_h if mascot else 0
+            # 名称气泡在图标旁边，窗口要留出放气泡的宽度
+            cross = max(cross, int(mascot_w + MARGIN + 12), int(MARGIN + self.bar_h + 230))
+        else:
+            self.mascot_h = min(B * float(self.cfg.get("mascot_size", 2.6)), cross - MARGIN - 6)
+        main = self.needed_main()
+        o = self.orient
+        if self.vertical:
+            main = min(int(main), scr.height())
+            x = scr.x() if o == "left" else scr.x() + scr.width() - cross
+            self.setGeometry(x, scr.y() + (scr.height() - main) // 2, cross, main)
+        else:
+            main = min(int(main), scr.width())
+            y = scr.y() if o == "top" else scr.y() + scr.height() - cross
+            self.setGeometry(scr.x() + (scr.width() - main) // 2, y, main, cross)
         self._last_dirty = self.rect()    # 窗口变了，下一帧整个重画
         self.update()
 
@@ -1993,10 +2414,16 @@ class Dock(QWidget):
             self._skin_pm = (None, None)      # 换了图（可能还是同一个文件名）就重新读
         if key.startswith("mascot"):
             self._mascot_pm = (None, None)
+            self._mascot_src = (None, None)   # 换了图（可能同名）要重新读
             self.relayout_window()
             self.update_breath_timer()
-        if key in ("show_clock", "show_volume", "show_tray_button", "hide_taskbar"):
+        if key in ("show_clock", "show_volume", "show_tray_button", "show_media", "hide_taskbar"):
             self.relayout_window()        # 右端小组件变了，Dock 宽度跟着变
+        if key == "position":
+            self.update_orient()
+            self.preview.hide()
+            self.group_popup.hide()
+            self.relayout_window()
         self.kick()
 
     # 图片缓存只认 (路径, 尺寸)，不在每帧去碰硬盘；换图时由 set_option 清掉缓存
@@ -2016,27 +2443,38 @@ class Dock(QWidget):
 
     # ---------- 看板娘
 
-    def mascot_pixmap(self):
+    def mascot_pixmap_raw(self):
+        """看板娘原图（只用来算宽高比），按路径缓存"""
         path = self.cfg.get("mascot_image") or ""
-        if not path or self.mascot_h <= 0:
+        if not path:
+            return None
+        if getattr(self, "_mascot_src", (None,))[0] != path:
+            img = QImage(path)
+            self._mascot_src = (path, None if img.isNull() else img)
+        return self._mascot_src[1]
+
+    def mascot_pixmap(self):
+        src = self.mascot_pixmap_raw()
+        if src is None or self.mascot_h <= 0:
             return None
         height = int(self.mascot_h * self.devicePixelRatioF())
-        if self._mascot_pm[0] != (path, height):
-            img = QImage(path)
-            pm = None if img.isNull() else QPixmap.fromImage(img.scaledToHeight(height, Qt.SmoothTransformation))
-            self._mascot_pm = ((path, height), pm)
+        key = (self.cfg.get("mascot_image"), height)
+        if self._mascot_pm[0] != key:
+            self._mascot_pm = (key, QPixmap.fromImage(src.scaledToHeight(height, Qt.SmoothTransformation)))
         return self._mascot_pm[1]
 
     def mascot_rect(self, bar):
         pm = self.mascot_pixmap()
         if pm is None:
             return None
+        """返回窗口坐标（她总是正着站，不跟着 Dock 方向转）"""
         h = self.mascot_h
         w = pm.width() / pm.height() * h
-        if self.mascot_dragging and self.mouse_pos is not None:
+        mw = getattr(self, "mouse_win", None)
+        if self.mascot_dragging and mw is not None:
             # 拖着她走：跟着鼠标，不出窗口
-            x = min(max(self.mouse_pos.x() - w / 2, 0), self.width() - w)
-            y = min(max(self.mouse_pos.y() - h * 0.4, 0), self.height() - h)
+            x = min(max(mw.x() - w / 2, 0), self.width() - w)
+            y = min(max(mw.y() - h * 0.4, 0), self.height() - h)
             return QRectF(x, y, w, h)
         now = time.monotonic()
         t = now - self.mascot_bounce
@@ -2046,8 +2484,21 @@ class Dock(QWidget):
             # 呼吸：以脚底为基准轻轻伸缩，约 3.2 秒一次
             s = 1 + 0.018 * math.sin(now * 2 * math.pi / 3.2)
             w, h = w * (1 - (s - 1) * 0.5), h * s
-        x = bar.right() + self.gap * 1.5 if self.cfg.get("mascot_side") != "left" else bar.left() - self.gap * 1.5 - w
-        return QRectF(x, bar.bottom() - h - hop, w, h)
+        at_start = self.cfg.get("mascot_side") == "left"      # left = Dock 开头那一端（竖着时是上端）
+        if self.vertical:
+            bw = self.win_rect(bar)
+            y = bw.top() - self.gap * 1.5 - h if at_start else bw.bottom() + self.gap * 1.5
+            x = bw.left() + hop if self.orient == "left" else bw.right() - w - hop
+            return QRectF(x, y, w, h)
+        x = bar.left() - self.gap * 1.5 - w if at_start else bar.right() + self.gap * 1.5
+        return self.win_rect(QRectF(x, bar.bottom() - h - hop, w, h))
+
+    def paint_theme(self):
+        """3D 玻璃台和倒影只适合贴在底边，换到别的位置时改成普通玻璃"""
+        th = self.theme
+        if self.orient != "bottom" and (th["bg"] == "shelf" or th["reflection"]):
+            th = dict(th, reflection=False, bg="glass" if th["bg"] == "shelf" else th["bg"])
+        return th
 
     def poke_mascot(self):
         lines = [s for s in self.cfg.get("mascot_lines") or [] if s] or ["……"]
@@ -2123,9 +2574,71 @@ class Dock(QWidget):
 
     def periodic(self):
         self.check_fullscreen()
+        self.sample_usage()
         # explorer 偶尔会自己把任务栏/图标显示回来，定时再藏一下
         if self.taskbar_hidden or self.icons_hidden:
             self.apply_shell()
+
+    # ---------- 使用时长
+
+    def sample_usage(self):
+        """每 1.5 秒看一眼前台是谁，把这段时间记到它头上（人离开超过 2 分钟不算）"""
+        now = time.monotonic()
+        dt, self._usage_last = now - self._usage_last, now
+        if dt > 10 or idle_seconds() > 120:
+            return                        # 睡眠唤醒 / 人不在电脑前
+        try:
+            fg = win32gui.GetForegroundWindow()
+            if not fg or win32gui.GetClassName(fg) in SKIP_CLASSES:
+                return
+            pid = win32process.GetWindowThreadProcessId(fg)[1]
+            if pid == os.getpid():
+                return
+            path = pid_path(pid)
+            if os.path.basename(path).lower() == "applicationframehost.exe":
+                path = pid_path(uwp_real_pid(fg, pid)) or path
+        except Exception:
+            return
+        if not path:
+            return
+        key = os.path.normcase(path)
+        owner = self.owner_of(key, fg, self.pinned_targets())
+        if owner is not None:
+            key, name = owner.target, owner.name
+        else:
+            if key not in self._roots:
+                self._roots[key] = find_app_root(key, path, fg)
+            key = self._roots[key][0]
+            running = next((it for it in self.running_items if it.target == key), None)
+            name = running.name if running else self.usage.names.get(key) or display_name(self._roots[key][1])
+        self.usage.add(key, name, dt)
+
+    def usage_today(self, item):
+        if item.children is not None:
+            return sum(self.usage_today(c) for c in item.children)
+        return self.usage.today(item.target) if item.target else 0
+
+    def evening_summary(self):
+        """晚上 10 点后，看板娘总结一下今天"""
+        day = UsageStats.today_key()
+        if self.summarized_day == day or time.localtime().tm_hour < 22 or self.mascot_pixmap() is None:
+            return
+        top = self.usage.totals(1)
+        total = sum(s for _, s in top)
+        self.summarized_day = day
+        if total < 1800 or not top:
+            return
+        key, secs = top[0]
+        name = self.usage.names.get(key) or os.path.basename(key)
+        self.remind("今天用了 %s 电脑，最久的是 %s（%s）……早点休息哦。" % (fmt_duration(total), name, fmt_duration(secs)))
+
+    def open_usage(self):
+        dlg = UsageWindow(self)
+        dlg.show()
+        dlg.activateWindow()
+        dlg.exec()
+        dlg.deleteLater()
+        QTimer.singleShot(1500, trim_memory)
 
     # ---------- 布局计算
 
@@ -2152,6 +2665,8 @@ class Dock(QWidget):
 
     def widget_kinds(self):
         kinds = []
+        if self.cfg.get("show_media", True) and getattr(self, "media_info", None):
+            kinds.append("media")
         if self.cfg.get("show_volume", True):
             kinds.append("volume")
         if self.cfg.get("show_tray_button", True) and self.cfg["hide_taskbar"]:
@@ -2164,7 +2679,9 @@ class Dock(QWidget):
         if kind == "sep":
             return self.sep_w
         if kind == "clock":
-            return round(self.B * 1.5)
+            return round(self.B * (1.25 if self.vertical else 1.5))
+        if kind == "media":
+            return round(self.B * (1.9 if self.vertical else 4.8))
         if kind in WIDGET_KINDS:
             return round(self.B * 0.62)
         return self.B
@@ -2172,7 +2689,7 @@ class Dock(QWidget):
     def rest_layout(self, slots):
         widths = [self.slot_width(kind) for kind, _ in slots]
         total = sum(widths) + self.gap * max(len(slots) - 1, 0)
-        x = (self.width() - total) / 2
+        x = (self.L - total) / 2
         lefts = []
         for w in widths:
             lefts.append(x)
@@ -2199,20 +2716,21 @@ class Dock(QWidget):
                 extra_left += (w - rw) * min(max((mx - left) / rw, 0.0), 1.0)
 
         result = []
-        x = (lefts[0] if lefts else self.width() / 2) - extra_left
+        L, C = self.L, self.C
+        x = (lefts[0] if lefts else L / 2) - extra_left
         for (kind, item), w in zip(slots, sizes):
             result.append((kind, item, x, w))
             x += w + gap
 
         hide_off = (1 - self.reveal) * (self.bar_h + MARGIN + 4)
-        bottom = self.height() - MARGIN + hide_off
+        bottom = C - MARGIN + hide_off
         if result:
             left, right = result[0][2] - pad, result[-1][2] + result[-1][3] + pad
         else:
-            left, right = self.width() / 2 - B * 1.6, self.width() / 2 + B * 1.6
+            left, right = L / 2 - B * 1.6, L / 2 + B * 1.6
         bar = QRectF(left, bottom - self.bar_h, right - left, self.bar_h)
-        zone_top = self.height() - MARGIN - pad - B * self.M - 10
-        zone = QRectF(left, zone_top, right - left, self.height() - zone_top)
+        zone_top = C - MARGIN - pad - B * self.M - 10
+        zone = QRectF(left, zone_top, right - left, C - zone_top)
         return result, bar, zone
 
     def item_at(self, pos):
@@ -2252,7 +2770,7 @@ class Dock(QWidget):
         return None
 
     def in_remove_zone(self, pos):
-        bar_top = self.height() - MARGIN - self.bar_h
+        bar_top = self.C - MARGIN - self.bar_h
         return pos.y() < bar_top - self.B * 1.3
 
     # ---------- 动画
@@ -2265,8 +2783,8 @@ class Dock(QWidget):
 
     def dirty_rect(self):
         """这一帧可能变化的区域：Dock 条 + 名称气泡 + 看板娘和她的台词气泡"""
-        if self.dragging or self.ext_drag:
-            return self.rect()            # 拖动的图标会跟着鼠标到处跑
+        if self.dragging or self.ext_drag or self.vertical or self.mascot_dragging:
+            return self.rect()            # 拖动的东西到处跑；竖着放时窗口本来就窄，整个刷新
         _, bar, _ = self.layout()
         margin = max(self.B, 120)         # 两头图标的名称气泡可能伸出 Dock 条
         r = QRect(int(bar.left() - margin), 0, int(bar.width() + 2 * margin), self.height())
@@ -2331,7 +2849,7 @@ class Dock(QWidget):
         # 兜底：鼠标快速划出时 leaveEvent 偶尔收不到
         if self.dragging or self.menu_open:
             return
-        pos = QPointF(self.mapFromGlobal(QCursor.pos()))
+        pos = self.abs_pt(QPointF(self.mapFromGlobal(QCursor.pos())))
         _, bar, zone = self.layout()
         if zone.contains(pos) or bar.contains(pos):
             if self.mouse_pos != pos:
@@ -2346,29 +2864,31 @@ class Dock(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
-        slots, bar, zone = self.layout()
-        th = self.theme
+        slots, bar, zone = self.layout()        # 抽象坐标（横着贴底边）
+        W, P = self.win_rect, self.win_pt          # → 窗口坐标
+        th = self.paint_theme()
         now = time.monotonic()
         B = self.B
+        bar_w = W(bar)
 
         # 几乎透明的命中区域：分层窗口里 alpha=0 的像素会被鼠标穿透
         if self.hovered or self.dragging or self.ext_drag:
-            p.fillRect(zone, QColor(0, 0, 0, 1))
+            p.fillRect(W(zone), QColor(0, 0, 0, 1))
         if self.cfg["auto_hide"] and self.reveal < 0.5:
-            p.fillRect(QRectF(bar.left(), self.height() - 3, bar.width(), 3), QColor(0, 0, 0, 1))
+            p.fillRect(W(QRectF(bar.left(), self.C - 3, bar.width(), 3)), QColor(0, 0, 0, 1))
         if self.reveal > 0.5:
-            p.fillRect(bar, QColor(0, 0, 0, 1))     # 透明皮肤 / 低不透明度时也能接住鼠标
+            p.fillRect(bar_w, QColor(0, 0, 0, 1))   # 透明皮肤 / 低不透明度时也能接住鼠标
 
         hovered_item = drop_rect = None
         if self.reveal > 0.01:
             p.setOpacity(min(1.0, self.reveal * 1.5))
-            path = bar_path(th, bar)
-            paint_background(p, th, bar, self.skin_image())
+            path = bar_path(th, bar_w)
+            paint_background(p, th, bar_w, self.skin_image())
 
             if not slots:
                 p.setPen(qc(th["text"]))
                 p.setFont(QFont("Microsoft YaHei UI", max(9, B // 6)))
-                p.drawText(bar, Qt.AlignCenter, "把程序拖到这里")
+                p.drawText(bar_w, Qt.AlignCenter, "拖程序到这里" if self.vertical else "把程序拖到这里")
 
             dpr = self.devicePixelRatioF()
             base_y = icon_base_y(th, bar, self.pad)
@@ -2376,13 +2896,16 @@ class Dock(QWidget):
             hovered_widget = group_rect = None
             for kind, item, x, w in slots:
                 if kind == "sep":
-                    paint_separator(p, th, x + w / 2, bar, self.pad)
+                    p.setPen(QPen(qc(th["sep"]), 1))
+                    cx = x + w / 2
+                    p.drawLine(P(QPointF(cx, bar.top() + self.pad * 0.7)), P(QPointF(cx, bar.bottom() - self.pad * 0.7)))
                     continue
+                in_slot = (self.mouse_pos is not None and self.hovered and not self.dragging
+                           and x - self.gap / 2 <= self.mouse_pos.x() < x + w + self.gap / 2)
                 if kind in WIDGET_KINDS:
-                    wrect = QRectF(x, bar.top(), w, bar.height())
-                    self.paint_widget(p, kind, wrect)
-                    if (self.mouse_pos is not None and self.hovered and not self.dragging
-                            and x - self.gap / 2 <= self.mouse_pos.x() < x + w + self.gap / 2):
+                    wrect = W(QRectF(x, bar.top(), w, bar.height()))
+                    self.paint_widget(p, kind, wrect, in_slot)
+                    if in_slot:
                         hovered_widget = (kind, wrect)
                     continue
                 if item is None:
@@ -2390,11 +2913,13 @@ class Dock(QWidget):
                 t = now - item.bounce_start
                 bounce = abs(math.sin(math.pi * t / (BOUNCE_TIME / 2))) * B * 0.38 * (1 - t / BOUNCE_TIME) \
                     if 0 <= t < BOUNCE_TIME else 0.0
-                rect = QRectF(x, base_y - w - bounce, w, w)
-                hovered = (self.mouse_pos is not None and self.hovered and not self.dragging
-                           and x - self.gap / 2 <= self.mouse_pos.x() < x + w + self.gap / 2)
-                paint_item(p, th, item, rect, base_y, item.running, hovered and self.hover_amt > 0.5,
+                rect = W(QRectF(x, base_y - w - bounce, w, w))
+                hovered = in_slot
+                paint_item(p, th, item, rect, base_y, False, hovered and self.hover_amt > 0.5,
                            path, ind_y, B, dpr)
+                if item.running:
+                    ip = P(QPointF(x + w / 2, ind_y))
+                    paint_indicator(p, th, ip.x(), ip.y(), B)
                 if item.attention:
                     self.paint_badge(p, rect)
                 if hovered:
@@ -2409,9 +2934,12 @@ class Dock(QWidget):
                 pm = self.mascot_pixmap()
                 p.drawPixmap(mrect, pm, QRectF(pm.rect()))
                 if now < self.mascot_say_until:
-                    # 她个子高、头顶没地方，气泡放在外侧肩膀旁边
-                    outer = "left" if self.cfg.get("mascot_side") == "left" else "right"
-                    self.draw_label(p, self.mascot_line, mrect, beside=outer)
+                    # 她个子高、头顶没地方，气泡放在旁边：横着放时在外侧，竖着放时朝屏幕里面
+                    if self.vertical:
+                        side = "right" if self.orient == "left" else "left"
+                    else:
+                        side = "left" if self.cfg.get("mascot_side") == "left" else "right"
+                    self.draw_label(p, self.mascot_line, mrect, beside=side)
 
             if drop_rect is not None:
                 self.draw_label(p, "移到回收站", drop_rect, red=True)
@@ -2419,7 +2947,9 @@ class Dock(QWidget):
                 self.draw_label(p, "放进分组" if self.group_drop.children is not None else "建立分组", group_rect)
             elif hovered_item and self.hover_amt > 0.5 and not self.preview.isVisible() \
                     and not self.group_popup.isVisible():
-                self.draw_label(p, hovered_item[0].name, hovered_item[1])
+                used = self.usage_today(hovered_item[0])
+                text = hovered_item[0].name + ("  ·  今天 " + fmt_duration(used) if used >= 60 else "")
+                self.draw_label(p, text, hovered_item[1])
             elif hovered_widget and self.hover_amt > 0.5:
                 self.draw_label(p, self.widget_tip(hovered_widget[0]), hovered_widget[1])
 
@@ -2428,30 +2958,45 @@ class Dock(QWidget):
             item = self.items[self.drag_idx]
             size = B * 1.1
             c = self.mouse_pos
-            cy = max(size / 2, c.y())
             removing = self.in_remove_zone(c)
+            wc = P(QPointF(c.x(), c.y()))
+            wc = QPointF(min(max(wc.x(), size / 2), self.width() - size / 2),
+                         min(max(wc.y(), size / 2), self.height() - size / 2))
+            r = QRectF(wc.x() - size / 2, wc.y() - size / 2, size, size)
             p.setOpacity(0.55 if removing else 0.9)
             pm = item.pixmap_for(size * self.devicePixelRatioF())
-            p.drawPixmap(QRectF(c.x() - size / 2, cy - size / 2, size, size), pm, QRectF(pm.rect()))
+            p.drawPixmap(r, pm, QRectF(pm.rect()))
             p.setOpacity(1.0)
             if removing:
-                self.draw_label(p, "松开移除", QRectF(c.x() - size / 2, cy - size / 2, size, size), red=True)
+                self.draw_label(p, "松开移除", r, red=True)
         p.end()
 
     def draw_label(self, p, text, icon_rect, red=False, beside=None):
+        """名称气泡：默认放在图标朝屏幕里面的那一侧；beside 指定放在左 / 右边"""
         font = QFont("Microsoft YaHei UI")
         font.setPixelSize(max(12, round(self.B * 0.25)))
         p.setFont(font)
         fm = QFontMetricsF(font)
+        direction = beside or {"up": "up", "down": "down", "right": "right", "left": "left"}[self.inward()]
+        # 气泡太长放不下（竖着放时窗口窄）就截短
+        room = self.width() - 4
+        if direction == "right":
+            room = self.width() - icon_rect.right() - 10
+        elif direction == "left":
+            room = icon_rect.left() - 10
+        if fm.horizontalAdvance(text) + 20 > room:
+            text = fm.elidedText(text, Qt.ElideRight, max(40, room - 20))
         tw, th = fm.horizontalAdvance(text) + 20, fm.height() + 8
-        x = min(max(icon_rect.center().x() - tw / 2, 2), self.width() - tw - 2)
-        y = icon_rect.top() - th - 8
-        if beside:
-            x = icon_rect.right() + 6 if beside == "right" else icon_rect.left() - tw - 6
-            x = min(max(x, 2), self.width() - tw - 2)
-            y = icon_rect.top() + icon_rect.height() * 0.12
-        elif y < 2:    # 上方放不下就放到图标下面
-            y = icon_rect.bottom() + 6
+        if direction in ("left", "right"):
+            x = icon_rect.right() + 6 if direction == "right" else icon_rect.left() - tw - 6
+            y = icon_rect.top() + icon_rect.height() * 0.12 if beside else icon_rect.center().y() - th / 2
+        else:
+            x = icon_rect.center().x() - tw / 2
+            y = icon_rect.top() - th - 8 if direction == "up" else icon_rect.bottom() + 8
+            if y < 2:                     # 上方放不下就放到图标下面
+                y = icon_rect.bottom() + 6
+        x = min(max(x, 2), self.width() - tw - 2)
+        y = min(max(y, 2), self.height() - th - 2)
         r = QRectF(x, y, tw, th)
         skin = self.theme
         border = skin["label_border"]
@@ -2464,9 +3009,9 @@ class Dock(QWidget):
     # ---------- 鼠标
 
     def enterEvent(self, e):
-        pos = e.position()
+        pos = self.abs_pt(e.position())
         _, bar, zone = self.layout()
-        if bar.contains(pos) or (self.cfg["auto_hide"] and pos.y() >= self.height() - 4):
+        if bar.contains(pos) or (self.cfg["auto_hide"] and pos.y() >= self.C - 4):
             self.mouse_pos = pos
             self.set_hovered(True)
 
@@ -2475,10 +3020,11 @@ class Dock(QWidget):
             self.set_hovered(False)
 
     def mouseMoveEvent(self, e):
-        pos = e.position()
+        self.mouse_win = e.position()
+        pos = self.abs_pt(e.position())
         self.mouse_pos = pos
         if self.mascot_press is not None and (e.buttons() & Qt.LeftButton):
-            if not self.mascot_dragging and (pos - self.mascot_press).manhattanLength() > 6:
+            if not self.mascot_dragging and (e.position() - self.mascot_press).manhattanLength() > 6:
                 self.mascot_dragging = True
             if self.mascot_dragging:
                 self.update()             # 她跟着鼠标到处跑，整窗重画
@@ -2504,12 +3050,13 @@ class Dock(QWidget):
         self.kick()
 
     def mousePressEvent(self, e):
-        pos = e.position()
+        self.mouse_win = e.position()
+        pos = self.abs_pt(e.position())
         self.preview_timer.stop()
         self.preview.hide()
         mrect = self.mascot_rect(self.layout()[1])
-        if e.button() == Qt.LeftButton and mrect is not None and mrect.contains(pos):
-            self.mascot_press = pos       # 松手时再决定是“点她”还是“拖她换边”
+        if e.button() == Qt.LeftButton and mrect is not None and mrect.contains(e.position()):
+            self.mascot_press = e.position()   # 松手时再决定是“点她”还是“拖她换边”
             return
         item = self.item_at(pos)
         if item is None or item is not self.group_popup.group:
@@ -2525,7 +3072,8 @@ class Dock(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
-        pos = e.position()
+        self.mouse_win = e.position()
+        pos = self.abs_pt(e.position())
         if self.mascot_press is not None:
             if self.mascot_dragging:
                 _, bar, _ = self.layout()
@@ -2550,7 +3098,7 @@ class Dock(QWidget):
             self.save_config()
             self.relayout_window()
         elif self.press_widget is not None and self.widget_at(pos) == self.press_widget:
-            self.run_widget(self.press_widget)
+            self.run_widget(self.press_widget, e.position())
         elif self.press_item is not None and self.item_at(pos) is self.press_item:
             self.activate(self.press_item)
         self.press_item = self.press_pos = self.press_widget = None
@@ -2560,8 +3108,8 @@ class Dock(QWidget):
         self.kick()
 
     def wheelEvent(self, e):
-        # 在音量 / 时钟上滚轮 = 调音量（每格 4%）
-        if self.widget_at(e.position()) in ("volume", "clock"):
+        # 在音量 / 时钟 / 正在播放上滚轮 = 调音量（每格 4%）
+        if self.widget_at(self.abs_pt(e.position())) in ("volume", "clock", "media"):
             steps = round(e.angleDelta().y() / 120)
             vk = VK_VOLUME_UP if steps > 0 else VK_VOLUME_DOWN
             for _ in range(abs(steps) * 2):
@@ -2592,7 +3140,7 @@ class Dock(QWidget):
         mime = e.mimeData()
         if not mime.hasUrls() or not all(u.isLocalFile() for u in mime.urls()):
             return None
-        item = self.item_at(e.position())
+        item = self.item_at(self.abs_pt(e.position()))
         return item if item is not None and item.is_recycle else None
 
     def dragEnterEvent(self, e):
@@ -2603,14 +3151,14 @@ class Dock(QWidget):
             self.dragMoveEvent(e)
 
     def dragMoveEvent(self, e):
-        self.mouse_pos = e.position()
+        self.mouse_pos = self.abs_pt(e.position())
         self.drop_on = self.recycle_drop_target(e)
         if self.drop_on is not None:
             self.drop_idx = None
             e.setDropAction(Qt.MoveAction)
             e.accept()
         else:
-            self.drop_idx = self.calc_drop_idx(e.position().x())
+            self.drop_idx = self.calc_drop_idx(self.mouse_pos.x())
             e.acceptProposedAction()
         self.kick()
 
@@ -2697,10 +3245,15 @@ class Dock(QWidget):
 
     def add_paths(self, paths, index=None):
         existing = {os.path.normcase(it.path) for it in self.pinned_flat()}
+        has_recycle = any(it.is_recycle for it in self.pinned_flat())
         index = len(self.items) if index is None else index
         for path in paths:
             if not path or os.path.normcase(path) in existing:
                 continue
+            if is_shell_path(path) and is_recycle_bin(path):
+                if has_recycle:           # 回收站有 shell:RecycleBinFolder / ::{CLSID} 两种写法，只留一个
+                    continue
+                has_recycle = True
             try:
                 self.items.insert(index, DockItem(path))
                 existing.add(os.path.normcase(path))
@@ -2840,14 +3393,10 @@ class Dock(QWidget):
             or self.windows_of(item)
         if not hwnds or (self.cfg.get("window_preview", "multi") == "multi" and len(hwnds) < 2):
             return
-        slots, bar, _ = self.layout()
-        for kind, it, x, w in slots:
-            if it is item:
-                top = icon_base_y(self.theme, bar, self.pad) - w - 8
-                g = self.mapToGlobal(QPoint(int(x + w / 2), int(top)))
-                self.preview.show_for(item, hwnds, g.x(), g.y())
-                self.kick()
-                return
+        anchor = self.popup_anchor(item)
+        if anchor is not None:
+            self.preview.show_for(item, hwnds, anchor, self.inward())
+            self.kick()
 
     def activate(self, item):
         self.preview.hide()
@@ -2955,6 +3504,7 @@ class Dock(QWidget):
             a = sysm.addAction(title, lambda p=path: self.add_paths([p]))
             a.setEnabled(os.path.normcase(path) not in have)
         self.build_settings_menu(m.addMenu("设置"))
+        m.addAction("使用统计…", self.open_usage)
         m.addSeparator()
         m.addAction("隐藏 Dock（托盘可恢复）", lambda: self.set_user_hidden(True))
         m.addAction("退出", QApplication.quit)
@@ -2988,6 +3538,7 @@ class Dock(QWidget):
         def option(title, key):
             toggle(title, self.cfg[key], lambda c: self.set_option(key, c))
 
+        radio("Dock 位置", "position", [("底部", "bottom"), ("顶部", "top"), ("左侧", "left"), ("右侧", "right")])
         radio("图标大小", "icon_size", [("小", 40), ("中", 52), ("大", 64), ("特大", 80)])
         radio("放大效果", "magnify", [("关闭", 1.0), ("轻微", 1.4), ("标准", 1.8), ("夸张", 2.3)])
         skins = [(s["name"], sid) for sid, s in SKINS.items()]
@@ -3029,6 +3580,8 @@ class Dock(QWidget):
 
         tray = sm.addMenu("时钟和托盘")
         tray.setStyleSheet(MENU_QSS)
+        if HAVE_MEDIA:
+            sub_option(tray, "显示正在播放", "show_media")
         sub_option(tray, "显示时钟", "show_clock")
         sub_option(tray, "显示音量按钮", "show_volume")
         sub_option(tray, "显示托盘按钮（隐藏任务栏时）", "show_tray_button")
@@ -3149,12 +3702,31 @@ class Dock(QWidget):
         # 退出时一定把任务栏和桌面图标还回去
         restore_shell()
         self.save_config()
+        self.usage.save()
+        if getattr(self, "media", None) is not None:
+            self.media.stop()
         for i in range(1, len(HOTKEY_ACTIONS) + 1):
             user32.UnregisterHotKey(int(self.winId()), i)
         user32.DeregisterShellHookWindow(int(self.winId()))
         self.monitor.requestInterruption()
         self.monitor.poke()
         self.monitor.wait(3000)
+
+
+def place_popup(w, h, anchor, direction):
+    """弹窗贴着 anchor 往 direction（up/down/left/right）方向展开，并保持在屏幕内"""
+    scr = (QGuiApplication.screenAt(anchor) or QGuiApplication.primaryScreen()).geometry()
+    if direction == "up":
+        x, y = anchor.x() - w // 2, anchor.y() - h
+    elif direction == "down":
+        x, y = anchor.x() - w // 2, anchor.y()
+    elif direction == "right":
+        x, y = anchor.x(), anchor.y() - h // 2
+    else:
+        x, y = anchor.x() - w, anchor.y() - h // 2
+    x = min(max(x, scr.left() + 6), scr.right() - w - 6)
+    y = min(max(y, scr.top() + 6), scr.bottom() - h - 6)
+    return QRect(int(x), int(y), int(w), int(h))
 
 
 # ---------------------------------------------------------------- 窗口预览（DWM 实时缩略图）
@@ -3233,21 +3805,21 @@ class WindowPreview(QWidget):
         self._fading_out = False
         super().hide()
 
-    def show_for(self, item, hwnds, anchor_x, bottom_y):
-        """anchor_x / bottom_y 是全局坐标：弹窗水平居中于图标、底边贴在图标上方"""
+    def show_for(self, item, hwnds, anchor, direction="up"):
+        """anchor 是全局坐标（图标朝屏幕里面那侧的中点），弹窗往 direction 方向展开"""
         if self.isVisible() and not self._fading_out and item is self.item \
                 and [c["hwnd"] for c in self.cards] == list(hwnds):
             return                         # 同一个图标、同一组窗口：不用重建
         self.clear_thumbs()
         self.item = item
+        self._anchor, self._direction = anchor, direction
         n = len(hwnds)
-        scr = (QGuiApplication.screenAt(QPoint(anchor_x, bottom_y)) or QGuiApplication.primaryScreen()).geometry()
+        scr = (QGuiApplication.screenAt(anchor) or QGuiApplication.primaryScreen()).geometry()
         card_w = min(self.CARD_W, (scr.width() - 2 * self.PAD - (n - 1) * self.GAP - 20) / n)
         thumb_h = card_w * self.THUMB_H / self.CARD_W
         w = int(2 * self.PAD + n * card_w + (n - 1) * self.GAP)
         h = int(2 * self.PAD + self.TITLE_H + thumb_h)
-        x = min(max(anchor_x - w // 2, scr.left() + 6), scr.right() - w - 6)
-        self.setGeometry(x, bottom_y - h, w, h)
+        self.setGeometry(place_popup(w, h, anchor, direction))
         self.cards = []
         for i, hwnd in enumerate(hwnds):
             rect = QRectF(self.PAD + i * (card_w + self.GAP), self.PAD, card_w, self.TITLE_H + thumb_h)
@@ -3393,8 +3965,7 @@ class WindowPreview(QWidget):
         if not hwnds:
             self.hide()
             return
-        geo = self.geometry()
-        self.show_for(self.item, hwnds, geo.center().x(), geo.bottom() + 1)
+        self.show_for(self.item, hwnds, self._anchor, self._direction)
 
     def maybe_hide(self):
         if self.geometry().contains(QCursor.pos()):
@@ -3402,6 +3973,108 @@ class WindowPreview(QWidget):
         if self.dock.hovered and self.dock._preview_item is self.item:
             return
         self.fade_out()
+
+
+# ---------------------------------------------------------------- 使用统计窗口
+
+class UsageList(QWidget):
+    ROW_H = 40
+
+    def __init__(self, dock):
+        super().__init__()
+        self.dock = dock
+        self.rows = []
+        self._icons = {}
+
+    def set_rows(self, rows):
+        self.rows = rows[:12]
+        self.setFixedHeight(max(1, len(self.rows)) * self.ROW_H + 8)
+        self.update()
+
+    def icon_for(self, key):
+        pm = self._icons.get(key)
+        if pm is None:
+            item = next((it for it in self.dock.all_items() if it.target == key), None)
+            img = item.image if item is not None else (extract_icon(key) or load_icon_image(key))
+            pm = QPixmap.fromImage(img.scaled(56, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self._icons[key] = pm
+        return pm
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        f = QFont("Microsoft YaHei UI")
+        f.setPixelSize(13)
+        p.setFont(f)
+        fm = QFontMetricsF(f)
+        if not self.rows:
+            p.setPen(QColor(150, 150, 160))
+            p.drawText(self.rect(), Qt.AlignCenter, "还没有记录，用一会儿电脑再来看吧")
+            return
+        top = self.rows[0][2] or 1
+        w = self.width()
+        for i, (key, name, secs) in enumerate(self.rows):
+            y = 4 + i * self.ROW_H
+            pm = self.icon_for(key)
+            p.drawPixmap(QRectF(4, y + 6, 28, 28), pm, QRectF(pm.rect()))
+            p.setPen(QColor(232, 232, 238))
+            p.drawText(QRectF(42, y, 150, self.ROW_H), Qt.AlignVCenter | Qt.AlignLeft,
+                       fm.elidedText(name, Qt.ElideRight, 150))
+            bar_x, bar_w = 200, w - 200 - 110
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 18))
+            p.drawRoundedRect(QRectF(bar_x, y + 15, bar_w, 10), 5, 5)
+            p.setBrush(QColor(59, 108, 240))
+            p.drawRoundedRect(QRectF(bar_x, y + 15, max(10, bar_w * secs / top), 10), 5, 5)
+            p.setPen(QColor(200, 200, 210))
+            p.drawText(QRectF(w - 104, y, 100, self.ROW_H), Qt.AlignVCenter | Qt.AlignRight, fmt_duration(secs))
+        p.end()
+
+
+class UsageWindow(QDialog):
+    def __init__(self, dock):
+        super().__init__()
+        self.dock = dock
+        self.setWindowTitle("使用统计 - " + APP_NAME)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint)
+        self.setStyleSheet(SKIN_CENTER_QSS + """
+            QPushButton:checked { background: #3b6cf0; border-color: #3b6cf0; }""")
+        self.setMinimumWidth(560)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 18)
+        lay.setSpacing(10)
+        head = QHBoxLayout()
+        title = QLabel("使用统计")
+        title.setObjectName("title")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.buttons = []
+        for label, days in (("今天", 1), ("最近 7 天", 7)):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _=False, d=days: self.show_days(d))
+            head.addWidget(b)
+            self.buttons.append((b, days))
+        lay.addLayout(head)
+        self.summary = QLabel()
+        lay.addWidget(self.summary)
+        self.list = UsageList(dock)
+        lay.addWidget(self.list)
+        tip = QLabel("只统计在前台、而且你正在用电脑的时间（离开超过 2 分钟不算）。数据只保存在本机。")
+        tip.setStyleSheet("color: #8a8a94; font-size: 12px;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        self.show_days(1)
+
+    def show_days(self, days):
+        for b, d in self.buttons:
+            b.setChecked(d == days)
+        usage = self.dock.usage
+        rows = [(k, usage.names.get(k) or os.path.basename(k), s) for k, s in usage.totals(days) if s >= 60]
+        total = sum(s for _, _, s in rows)
+        self.summary.setText(("今天" if days == 1 else "最近 7 天") + "一共用了 %s" % fmt_duration(total))
+        self.list.set_rows(rows)
+        self.adjustSize()
 
 
 # ---------------------------------------------------------------- 分组弹窗
@@ -3420,16 +4093,14 @@ class GroupPopup(QWidget):
         self.cells = []
         self.hide_timer = QTimer(self, singleShot=True, interval=500, timeout=self.maybe_hide)
 
-    def show_for(self, group, anchor_x, bottom_y):
+    def show_for(self, group, anchor, direction="up"):
         self.group = group
         n = len(group.children)
         cols = min(5, max(1, n))
         rows = (n + cols - 1) // cols
         w = 2 * self.PAD + cols * self.CELL_W
         h = 2 * self.PAD + self.TITLE_H + rows * self.CELL_H
-        scr = (QGuiApplication.screenAt(QPoint(anchor_x, bottom_y)) or QGuiApplication.primaryScreen()).geometry()
-        x = min(max(anchor_x - w // 2, scr.left() + 6), scr.right() - w - 6)
-        self.setGeometry(x, bottom_y - h, w, h)
+        self.setGeometry(place_popup(w, h, anchor, direction))
         self.cells = [QRectF(self.PAD + (i % cols) * self.CELL_W, self.PAD + self.TITLE_H + (i // cols) * self.CELL_H,
                              self.CELL_W, self.CELL_H) for i in range(n)]
         self.hover = None
@@ -3529,7 +4200,7 @@ class GroupPopup(QWidget):
     def maybe_hide(self):
         if self.geometry().contains(QCursor.pos()):
             return
-        local = QPointF(self.dock.mapFromGlobal(QCursor.pos()))
+        local = self.dock.abs_pt(QPointF(self.dock.mapFromGlobal(QCursor.pos())))
         if self.dock.isVisible() and self.dock.item_at(local) is self.group:
             self.hide_timer.start()       # 鼠标还在分组图标上，再等等
             return
@@ -3974,6 +4645,7 @@ def main():
     tmenu.addAction("添加程序 / 文件…", dock.add_file_dialog)
     tmenu.addAction("皮肤中心…", dock.open_skin_center)
     tmenu.addAction("快捷键设置…", dock.edit_hotkeys)
+    tmenu.addAction("使用统计…", dock.open_usage)
     tmenu.addSeparator()
     tmenu.addAction("退出", app.quit)
     tray.setContextMenu(tmenu)

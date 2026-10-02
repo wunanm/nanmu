@@ -3,6 +3,8 @@ dock_config.json
 dock_config.json.tmp
 dock_config.json.bak
 dock_error.log
+usage.json
+usage.json.tmp
 links/
 skins/
 
