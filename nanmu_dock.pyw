@@ -2723,9 +2723,9 @@ class Dock(QWidget):
         else:
             if key not in self._roots:
                 self._roots[key] = find_app_root(key, path, fg)
-            key = self._roots[key][0]
+            key, root_path = self._roots[key]
             running = next((it for it in self.running_items if it.target == key), None)
-            name = running.name if running else self.usage.names.get(key) or display_name(self._roots[key][1])
+            name = running.name if running else self.usage.names.get(key) or display_name(root_path)
         self.usage.add(key, name, dt)
 
     def usage_today(self, item):
