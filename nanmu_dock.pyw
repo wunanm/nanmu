@@ -585,6 +585,58 @@ def enum_app_windows():
     return result
 
 
+# 这些窗口类肯定不是程序主窗口（输入法、系统消息窗口之类）
+HIDDEN_JUNK_CLASSES = {"IME", "MSCTFIME UI", "SoPY_Hint", "OleDdeWndClass", "Static", "tooltips_class32"}
+
+
+def hidden_main_window(item):
+    """程序点 × 缩到托盘后，主窗口其实还在、只是被隐藏了。在它的进程里找最像主窗口的那个：
+    标题和程序名对得上、有标题栏和最小化按钮、尺寸像个正经窗口。拿不准就返回 None（宁可不弹，也别弹出辅助窗口）"""
+    if not item.target or item.children is not None:
+        return None
+    tdir = os.path.dirname(item.target)
+    same_tree = tdir not in SHARED_DIRS
+    # 能对得上的名字：Dock 上显示的名字（可能被改过）、exe 文件名、exe 自带的描述
+    names = {item.name.lower(), os.path.splitext(os.path.basename(item.target))[0].lower(),
+             (exe_description(item.target) or "").lower()} - {""}
+    best = [0, None]
+
+    def cb(h, _):
+        if win32gui.IsWindowVisible(h) or win32gui.GetWindow(h, win32con.GW_OWNER):
+            return True
+        title = win32gui.GetWindowText(h)
+        cls = win32gui.GetClassName(h)
+        if not title or cls in HIDDEN_JUNK_CLASSES or cls.startswith(("Sogou", ".NET-", "GDI+")):
+            return True
+        if win32gui.GetWindowLong(h, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOOLWINDOW:
+            return True
+        l, t, r, b = win32gui.GetWindowRect(h)
+        if r - l < 300 or b - t < 200:
+            return True
+        path = os.path.normcase(pid_path(win32process.GetWindowThreadProcessId(h)[1]))
+        # 同一个程序：exe 一样，或者在它安装目录里（Steam 的界面在 steamwebhelper 子进程里）
+        if not (path == item.target or (same_tree and path.startswith(tdir + "\\") and "\\steamapps\\" not in path)):
+            return True
+        tl = title.lower()
+        if not any(tl == n or n in tl or tl in n for n in names):
+            return True                   # 名字对不上的不要：多半是 SDK / 辅助窗口
+        score = 1
+        style = win32gui.GetWindowLong(h, win32con.GWL_STYLE)
+        if style & win32con.WS_CAPTION == win32con.WS_CAPTION:
+            score += 2
+        if style & win32con.WS_MINIMIZEBOX:
+            score += 1
+        if score > best[0]:
+            best[0], best[1] = score, h
+        return True
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        pass
+    return best[1]
+
+
 def minimize_window(hwnd):
     # 用“标题栏最小化按钮”的系统命令：有些程序（WeGame 等 CEF 窗口）不理 ShowWindow
     win32gui.PostMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_MINIMIZE, 0)
@@ -3488,6 +3540,18 @@ class Dock(QWidget):
             else:
                 focus_window(wins[0])
             return
+        # 点了 × 缩到托盘的程序：进程还在、窗口被藏起来了，直接把主窗口显示回来
+        hidden = hidden_main_window(item)
+        if hidden:
+            win32gui.ShowWindow(hidden, win32con.SW_SHOW)
+            focus_window(hidden)
+            self.monitor.poke()
+            # 以管理员身份运行的程序，Windows 不让普通程序动它的窗口（显示命令会被悄悄拦掉）；
+            # 半秒后还没出来，就改成运行一次，让程序自己把窗口叫出来
+            QTimer.singleShot(500, lambda: None if win32gui.IsWindow(hidden) and win32gui.IsWindowVisible(hidden)
+                              else self.launch(item))
+            return
+        # 没开着 / 找不到藏起来的窗口：运行一次（多数程序会把已开着的那个叫出来）
         self.launch(item)
 
     def launch(self, item, admin=False):
