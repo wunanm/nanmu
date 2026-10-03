@@ -38,14 +38,14 @@ import winreg
 from ctypes import wintypes
 
 from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QRect, QSize, QFileInfo, QThread, Signal,
-                            QVariantAnimation)
+                            QVariantAnimation, QObject, QPoint)
 from PySide6.QtGui import (QPainter, QColor, QPainterPath, QPixmap, QImage, QIcon, QFont, QKeySequence,
                            QFontMetricsF, QCursor, QPen, QBrush, QLinearGradient, QRadialGradient, QTransform,
                            QActionGroup, QGuiApplication, QFontDatabase)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QFileIconProvider, QSystemTrayIcon,
                                QInputDialog, QFileDialog, QStyle, QMessageBox, QDialog, QVBoxLayout,
                                QHBoxLayout, QGridLayout, QLabel, QKeySequenceEdit, QLineEdit,
-                               QSlider, QPushButton, QColorDialog, QComboBox, QCheckBox)
+                               QSlider, QPushButton, QColorDialog, QComboBox, QCheckBox, QToolTip)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 import pythoncom
@@ -103,6 +103,7 @@ DEFAULT_CONFIG = {
     "show_media": True,       # Dock 右端的“正在播放”
     "show_clock": True,       # Dock 右端的时钟
     "show_power": True,       # 关机键（锁定 / 睡眠 / 注销 / 重启 / 关机）
+    "tray_bar": False,        # 屏幕右上角的托盘栏（像 BitDock 的 BitBar）
     "show_volume": True,      # 音量按钮
     "show_tray_button": True,  # 托盘按钮（隐藏任务栏时才显示）
     "auto_hide": False,
@@ -795,8 +796,19 @@ class MediaWatcher(QThread):
 
 # ---------------------------------------------------------------- 隐藏任务栏 / 桌面图标
 
+def explorer_tray():
+    """系统（explorer）真正的任务栏窗口。顶部托盘栏开着时 Dock 自己也有一个同名窗口，要跳过它"""
+    me, h = os.getpid(), 0
+    while True:
+        h = win32gui.FindWindowEx(0, h, "Shell_TrayWnd", None)
+        if not h:
+            return 0
+        if win32process.GetWindowThreadProcessId(h)[1] != me:
+            return h
+
+
 def taskbar_windows():
-    wins = [win32gui.FindWindow("Shell_TrayWnd", None)]
+    wins = [explorer_tray()]
     h = 0
     while True:
         h = win32gui.FindWindowEx(0, h, "Shell_SecondaryTrayWnd", None)
@@ -804,6 +816,200 @@ def taskbar_windows():
             break
         wins.append(h)
     return [w for w in wins if w]
+
+
+# ---------------------------------------------------------------- 托盘图标（顶部托盘栏）
+# 程序调用 Shell_NotifyIcon 往托盘放图标时，系统会找类名为 Shell_TrayWnd 的窗口、用 WM_COPYDATA 把图标信息发过去。
+# Dock 注册一个同名的隐藏窗口（放在最上层，先被找到）就能收到所有托盘图标；收到的消息原样转发给系统任务栏，
+# 系统托盘照常工作。点击时按程序注册的回调消息发回给程序，程序会自己弹菜单 / 显示窗口。
+
+class COPYDATASTRUCT(ctypes.Structure):
+    _fields_ = [("dwData", ctypes.c_size_t), ("cbData", wintypes.DWORD), ("lpData", ctypes.c_void_p)]
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8)]
+
+
+class NOTIFYICONDATA32(ctypes.Structure):
+    """托盘消息里的 NOTIFYICONDATAW（句柄统一是 32 位，64 位程序发来的也一样）"""
+    _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.DWORD), ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.DWORD),
+                ("szTip", ctypes.c_wchar * 128), ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD),
+                ("szInfo", ctypes.c_wchar * 256), ("uVersion", wintypes.UINT), ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", wintypes.DWORD), ("guidItem", GUID), ("hBalloonIcon", wintypes.DWORD)]
+
+
+class SHELLTRAYDATA(ctypes.Structure):
+    _fields_ = [("dwSignature", wintypes.DWORD), ("dwMessage", wintypes.DWORD), ("nid", NOTIFYICONDATA32)]
+
+
+NIM_ADD, NIM_MODIFY, NIM_DELETE, NIM_SETVERSION = 0, 1, 2, 4
+NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_STATE, NIF_GUID = 0x1, 0x2, 0x4, 0x8, 0x20
+NIS_HIDDEN = 0x1
+NIN_SELECT = win32con.WM_USER
+user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                       wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+
+
+class TrayIcon:
+    def __init__(self, hwnd, uid):
+        self.hwnd, self.uid = hwnd, uid
+        self.callback = 0
+        self.version = 0
+        self.tip = ""
+        self.image = None
+        self.hidden = False
+
+    def send(self, kind, x, y):
+        """按程序注册的方式把鼠标点击发回给它（kind：left / right / double）"""
+        if not self.callback or not win32gui.IsWindow(self.hwnd):
+            return
+        try:
+            # 让程序可以把自己的菜单 / 窗口放到前台
+            user32.AllowSetForegroundWindow(win32process.GetWindowThreadProcessId(self.hwnd)[1])
+        except Exception:
+            pass
+
+        def post(msg):
+            if self.version >= 4:
+                wp = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+                lp = ((self.uid & 0xFFFF) << 16) | msg
+            else:
+                wp, lp = self.uid, msg
+            try:
+                win32gui.PostMessage(self.hwnd, self.callback, wp, lp)
+            except Exception:
+                pass
+
+        post(win32con.WM_MOUSEMOVE)
+        if kind == "right":
+            post(win32con.WM_RBUTTONDOWN)
+            post(win32con.WM_RBUTTONUP)
+            if self.version >= 4:
+                post(win32con.WM_CONTEXTMENU)
+        elif kind == "double":
+            post(win32con.WM_LBUTTONDBLCLK)
+            post(win32con.WM_LBUTTONUP)
+        else:
+            post(win32con.WM_LBUTTONDOWN)
+            post(win32con.WM_LBUTTONUP)
+            if self.version >= 4:
+                post(NIN_SELECT)
+
+
+class TrayHost(QObject):
+    """冒充 Shell_TrayWnd 接收所有程序的托盘图标"""
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.icons = {}                   # key → TrayIcon（插入顺序 = 显示顺序）
+        self.hwnd = 0
+
+    def start(self):
+        if self.hwnd:
+            return
+        hinst = win32api.GetModuleHandle(None)
+        wc = win32gui.WNDCLASS()
+        wc.lpszClassName = "Shell_TrayWnd"
+        wc.lpfnWndProc = self.wndproc
+        wc.hInstance = hinst
+        try:
+            win32gui.RegisterClass(wc)
+        except Exception:
+            pass                          # 上次注册过了
+        self.hwnd = win32gui.CreateWindowEx(win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_TOPMOST, "Shell_TrayWnd", "",
+                                            win32con.WS_POPUP, 0, 0, 0, 0, 0, 0, hinst, None)
+        self.keep_on_top()
+        # 让所有程序把托盘图标重新报一遍（explorer 重启后它们也是这样做的）
+        win32gui.PostMessage(win32con.HWND_BROADCAST, user32.RegisterWindowMessageW("TaskbarCreated"), 0, 0)
+
+    def stop(self):
+        if self.hwnd:
+            win32gui.DestroyWindow(self.hwnd)
+            self.hwnd = 0
+            try:
+                win32gui.UnregisterClass("Shell_TrayWnd", win32api.GetModuleHandle(None))
+            except Exception:
+                pass
+        self.icons.clear()
+        self.changed.emit()
+
+    def keep_on_top(self):
+        """系统找托盘窗口时取最上层的那个；我们的窗口要一直在系统任务栏上面，大小也跟它一样（有程序按它定位弹窗）"""
+        if not self.hwnd:
+            return
+        real = explorer_tray()
+        try:
+            l, t, r, b = win32gui.GetWindowRect(real) if real else (0, 0, 0, 0)
+            win32gui.SetWindowPos(self.hwnd, win32con.HWND_TOPMOST, l, t, r - l, b - t, win32con.SWP_NOACTIVATE)
+        except Exception:
+            pass
+
+    def cleanup(self):
+        """程序退出时有时不删托盘图标，窗口没了就去掉"""
+        dead = [k for k, ic in self.icons.items() if not win32gui.IsWindow(ic.hwnd)]
+        for k in dead:
+            del self.icons[k]
+        if dead:
+            self.changed.emit()
+
+    def wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == win32con.WM_COPYDATA and lparam:
+            # 先原样转发给系统任务栏，让系统托盘照常工作
+            result = ctypes.c_size_t(0)
+            real = explorer_tray()
+            if real:
+                user32.SendMessageTimeoutW(real, msg, wparam, lparam, win32con.SMTO_ABORTIFHUNG, 2000,
+                                           ctypes.byref(result))
+            try:
+                cds = COPYDATASTRUCT.from_address(lparam)
+                if cds.dwData == 1 and cds.cbData >= 8 and cds.lpData:
+                    self.handle(cds)
+                    return 1
+            except Exception as e:
+                log_error("解析托盘消息失败: %r" % e)
+            return result.value
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def handle(self, cds):
+        buf = (ctypes.c_char * ctypes.sizeof(SHELLTRAYDATA))()
+        ctypes.memmove(buf, cds.lpData, min(cds.cbData, ctypes.sizeof(SHELLTRAYDATA)))
+        data = SHELLTRAYDATA.from_buffer(buf)
+        if data.dwSignature != 0x34753423:
+            return
+        nid, op = data.nid, data.dwMessage
+        g = nid.guidItem
+        guid = (g.Data1, g.Data2, g.Data3, bytes(g.Data4)) if nid.uFlags & NIF_GUID and g.Data1 else None
+        key = guid or (nid.hWnd, nid.uID)
+        if op == NIM_DELETE:
+            if self.icons.pop(key, None) is not None:
+                self.changed.emit()
+            return
+        ic = self.icons.get(key)
+        if op == NIM_SETVERSION:
+            if ic is not None:
+                ic.version = nid.uVersion
+            return
+        if op not in (NIM_ADD, NIM_MODIFY):
+            return
+        if ic is None:
+            ic = self.icons[key] = TrayIcon(nid.hWnd, nid.uID)
+        ic.hwnd, ic.uid = nid.hWnd, nid.uID
+        if nid.uFlags & NIF_MESSAGE:
+            ic.callback = nid.uCallbackMessage
+        if nid.uFlags & NIF_ICON and nid.hIcon:
+            img = QImage.fromHICON(nid.hIcon)    # 马上复制一份：程序之后可能销毁这个图标
+            if not img.isNull():
+                ic.image = img
+        if nid.uFlags & NIF_TIP:
+            ic.tip = nid.szTip
+        if nid.uFlags & NIF_STATE and nid.dwStateMask & NIS_HIDDEN:
+            ic.hidden = bool(nid.dwState & NIS_HIDDEN)
+        self.changed.emit()
 
 
 _icon_views = []
@@ -1760,6 +1966,10 @@ class Dock(QWidget):
             self.media.changed.connect(self.on_media)
             self.media.start()
 
+        self.tray_host = self.tray_bar = None
+        self._tray_tick = 0
+        self.apply_tray_bar()
+
         self.launch_failed.connect(lambda n, err: self.tray_message("启动失败：" + n, err))
         screen = QGuiApplication.primaryScreen()
         screen.availableGeometryChanged.connect(lambda _: self.relayout_window())
@@ -2539,6 +2749,10 @@ class Dock(QWidget):
             self.preview.hide()
             self.group_popup.hide()
             self.relayout_window()
+        if key == "tray_bar":
+            self.apply_tray_bar()
+        if self.tray_bar is not None and key in ("position", "hide_taskbar", "skin", "skin_opacity"):
+            self.tray_bar.relayout()
         self.kick()
 
     # 图片缓存只认 (路径, 尺寸)，不在每帧去碰硬盘；换图时由 set_option 清掉缓存
@@ -2687,9 +2901,40 @@ class Dock(QWidget):
         restore_shell()
         self.save_config()
 
+    # ---------- 顶部托盘栏
+
+    def apply_tray_bar(self):
+        on = bool(self.cfg.get("tray_bar", False))
+        if on and self.tray_host is None:
+            self.tray_host = TrayHost()
+            self.tray_bar = TrayBar(self, self.tray_host)
+            self.tray_host.start()
+            self.tray_bar.relayout()
+            self.sync_tray_bar()
+        elif not on and self.tray_host is not None:
+            self.tray_bar.hide()
+            self.tray_bar.deleteLater()
+            self.tray_host.stop()
+            self.tray_host = self.tray_bar = None
+
+    def sync_tray_bar(self):
+        if self.tray_bar is None:
+            return
+        show = self.isVisible() and not self.fs_hidden and not self.user_hidden
+        if show and not self.tray_bar.isVisible():
+            self.tray_bar.relayout()
+            self.tray_bar.show()
+        elif not show and self.tray_bar.isVisible():
+            self.tray_bar.hide()
+
     def periodic(self):
         self.check_fullscreen()
         self.sample_usage()
+        if self.tray_host is not None:
+            self.tray_host.keep_on_top()          # 系统任务栏偶尔会跑到我们上面
+            self._tray_tick += 1
+            if self._tray_tick % 4 == 0:
+                self.tray_host.cleanup()
         # explorer 偶尔会自己把任务栏/图标显示回来，定时再藏一下
         if self.taskbar_hidden or self.icons_hidden:
             self.apply_shell()
@@ -3721,6 +3966,11 @@ class Dock(QWidget):
             sub_option(tray, "显示正在播放", "show_media")
         sub_option(tray, "显示时钟", "show_clock")
         sub_option(tray, "显示关机键", "show_power")
+        tray.addSeparator()
+        a = tray.addAction("右上角托盘栏（像 BitBar）")
+        a.setCheckable(True)
+        a.setChecked(bool(self.cfg.get("tray_bar", False)))
+        a.triggered.connect(lambda c: self.set_option("tray_bar", c))
         sub_option(tray, "显示音量按钮", "show_volume")
         sub_option(tray, "显示托盘按钮（隐藏任务栏时）", "show_tray_button")
 
@@ -3802,6 +4052,7 @@ class Dock(QWidget):
             self.preview.hide()
             self.group_popup.hide()
         self.update_breath_timer()
+        self.sync_tray_bar()
 
     def check_fullscreen(self):
         # 不管“全屏时隐藏”开没开都要检测：游戏时长提醒也靠它
@@ -3835,6 +4086,7 @@ class Dock(QWidget):
         hwnd = int(self.winId())
         ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
         win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex | WS_EX_NOACTIVATE)
+        QTimer.singleShot(0, self.sync_tray_bar)     # 托盘栏跟着 Dock 一起出现
 
     def shutdown(self):
         # 退出时一定把任务栏和桌面图标还回去
@@ -3843,6 +4095,8 @@ class Dock(QWidget):
         self.usage.save()
         if getattr(self, "media", None) is not None:
             self.media.stop()
+        if getattr(self, "tray_host", None) is not None:
+            self.tray_host.stop()             # 撤掉冒充的托盘窗口，程序的托盘消息就只发给系统了
         for i in range(1, len(HOTKEY_ACTIONS) + 1):
             user32.UnregisterHotKey(int(self.winId()), i)
         user32.DeregisterShellHookWindow(int(self.winId()))
@@ -4213,6 +4467,105 @@ class UsageWindow(QDialog):
         self.summary.setText(("今天" if days == 1 else "最近 7 天") + "一共用了 %s" % fmt_duration(total))
         self.list.set_rows(rows)
         self.adjustSize()
+
+
+# ---------------------------------------------------------------- 顶部托盘栏（像 BitDock 的 BitBar）
+
+class TrayBar(QWidget):
+    """屏幕右上角的一条小栏，显示所有程序的托盘图标：左键打开，右键是程序自己的菜单（退出等）"""
+    ICON, GAP, PAD, H = 20, 10, 10, 32
+
+    def __init__(self, dock, host):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setMouseTracking(True)
+        self.dock, self.host = dock, host
+        self.hover = None
+        self.host.changed.connect(self.relayout)
+
+    def visible_icons(self):
+        # 没有回调消息的（系统自己的音量 / 安全中心等）点了也没反应，不显示
+        return [ic for ic in self.host.icons.values() if not ic.hidden and ic.image is not None and ic.callback]
+
+    def relayout(self):
+        icons = self.visible_icons()
+        n = max(1, len(icons))
+        w = self.PAD * 2 + n * self.ICON + (n - 1) * self.GAP
+        screen = QGuiApplication.primaryScreen()
+        scr = screen.geometry() if self.dock.taskbar_hidden else screen.availableGeometry()
+        y = scr.top() + 6
+        if self.dock.orient == "top":
+            y = scr.top() + self.dock.height() + 4          # Dock 在顶部时让开它
+        self.setGeometry(scr.right() - w - 8, y, w, self.H)
+        self.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        hwnd = int(self.winId())
+        ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex | WS_EX_NOACTIVATE)
+
+    def icon_rects(self):
+        return [(ic, QRectF(self.PAD + i * (self.ICON + self.GAP), (self.H - self.ICON) / 2, self.ICON, self.ICON))
+                for i, ic in enumerate(self.visible_icons())]
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        th = dict(self.dock.paint_theme(), decor=None, bg="glass" if self.dock.theme["bg"] != "none" else "none")
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.fillRect(rect, QColor(0, 0, 0, 1))              # 透明皮肤也能接住鼠标
+        paint_background(p, th, rect, None)
+        icons = self.icon_rects()
+        if not icons:
+            p.setPen(qc(th["text"]))
+            p.setFont(QFont("Microsoft YaHei UI", 8))
+            p.drawText(rect, Qt.AlignCenter, "…")
+        for i, (ic, r) in enumerate(icons):
+            if i == self.hover:
+                c = qc(th["text"], 40)
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawRoundedRect(r.adjusted(-4, -4, 4, 4), 6, 6)
+            p.drawImage(r, ic.image)
+        p.end()
+
+    def icon_at(self, pos):
+        for i, (ic, r) in enumerate(self.icon_rects()):
+            if r.adjusted(-self.GAP / 2, -6, self.GAP / 2, 6).contains(pos):
+                return i, ic
+        return None, None
+
+    def mouseMoveEvent(self, e):
+        i, ic = self.icon_at(e.position())
+        if i != self.hover:
+            self.hover = i
+            self.update()
+            if ic is not None and ic.tip:
+                QToolTip.showText(e.globalPosition().toPoint() + QPoint(0, 18), ic.tip, self)
+            else:
+                QToolTip.hideText()
+
+    def leaveEvent(self, _):
+        self.hover = None
+        self.update()
+
+    def click(self, e, kind):
+        _, ic = self.icon_at(e.position())
+        if ic is not None:
+            x, y = win32api.GetCursorPos()          # 物理像素坐标，程序拿它定位自己的菜单
+            ic.send(kind, x, y)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.click(e, "left")
+        elif e.button() == Qt.RightButton:
+            self.click(e, "right")
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.click(e, "double")
 
 
 # ---------------------------------------------------------------- 分组弹窗
