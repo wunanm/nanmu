@@ -104,6 +104,8 @@ DEFAULT_CONFIG = {
     "show_clock": True,       # Dock 右端的时钟
     "show_power": True,       # 关机键（锁定 / 睡眠 / 注销 / 重启 / 关机）
     "tray_bar": False,        # 屏幕右上角的托盘栏（像 BitDock 的 BitBar）
+    "tray_bar_collapsed": True,      # 托盘栏收起（只剩一个小拉手）
+    "tray_bar_autocollapse": True,   # 展开后鼠标离开 3 秒自动收起
     "show_volume": True,      # 音量按钮
     "show_tray_button": True,  # 托盘按钮（隐藏任务栏时才显示）
     "auto_hide": False,
@@ -1112,6 +1114,7 @@ HOTKEY_ACTIONS = [
     ("desktop_icons", "显示 / 隐藏桌面图标", "Ctrl+Alt+D"),
     ("dock", "显示 / 隐藏 Dock", "Ctrl+Alt+H"),
     ("taskbar", "显示 / 隐藏 Windows 任务栏", ""),
+    ("traybar", "展开 / 收起右上角托盘栏", ""),
 ]
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
 _SPECIAL_VK = {Qt.Key_Space: 0x20, Qt.Key_PageUp: 0x21, Qt.Key_PageDown: 0x22, Qt.Key_End: 0x23,
@@ -2506,6 +2509,12 @@ class Dock(QWidget):
             self.set_user_hidden(not self.user_hidden)
         elif action == "taskbar":
             self.set_option("hide_taskbar", not self.cfg["hide_taskbar"])
+        elif action == "traybar":
+            if self.tray_bar is None:
+                self.set_option("tray_bar", True)     # 没开的话先打开
+                self.tray_bar.set_expanded(True)
+            else:
+                self.tray_bar.toggle()
 
     def edit_hotkeys(self):
         dlg = QDialog()
@@ -3966,13 +3975,14 @@ class Dock(QWidget):
             sub_option(tray, "显示正在播放", "show_media")
         sub_option(tray, "显示时钟", "show_clock")
         sub_option(tray, "显示关机键", "show_power")
+        sub_option(tray, "显示音量按钮", "show_volume")
+        sub_option(tray, "显示托盘按钮（隐藏任务栏时）", "show_tray_button")
         tray.addSeparator()
         a = tray.addAction("右上角托盘栏（像 BitBar）")
         a.setCheckable(True)
         a.setChecked(bool(self.cfg.get("tray_bar", False)))
         a.triggered.connect(lambda c: self.set_option("tray_bar", c))
-        sub_option(tray, "显示音量按钮", "show_volume")
-        sub_option(tray, "显示托盘按钮（隐藏任务栏时）", "show_tray_button")
+        sub_option(tray, "托盘栏离开 3 秒自动收起", "tray_bar_autocollapse")
 
         sub_option(sm, "消息提醒（图标跳动 + 红点）", "notify_flash")
 
@@ -4473,7 +4483,7 @@ class UsageWindow(QDialog):
 
 class TrayBar(QWidget):
     """屏幕右上角的一条小栏，显示所有程序的托盘图标：左键打开，右键是程序自己的菜单（退出等）"""
-    ICON, GAP, PAD, H = 20, 10, 10, 32
+    ICON, GAP, PAD, H, HANDLE = 20, 10, 10, 32, 26
 
     def __init__(self, dock, host):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.NoDropShadowWindowHint)
@@ -4481,24 +4491,54 @@ class TrayBar(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
         self.dock, self.host = dock, host
-        self.hover = None
+        self.hover = None                 # 鼠标下的图标序号；"handle" = 收起 / 展开按钮
+        self.expanded = not dock.cfg.get("tray_bar_collapsed", True)
+        self.amt = 1.0 if self.expanded else 0.0       # 0 = 收起，1 = 展开（带动画）
+        self.anim = QVariantAnimation(self, duration=160)
+        self.anim.valueChanged.connect(self._on_anim)
+        # 展开后鼠标离开 3 秒自动收起
+        self.collapse_timer = QTimer(self, singleShot=True, interval=3000, timeout=lambda: self.set_expanded(False))
         self.host.changed.connect(self.relayout)
 
     def visible_icons(self):
         # 没有回调消息的（系统自己的音量 / 安全中心等）点了也没反应，不显示
         return [ic for ic in self.host.icons.values() if not ic.hidden and ic.image is not None and ic.callback]
 
+    def full_width(self):
+        n = len(self.visible_icons())
+        return self.HANDLE + self.PAD + n * self.ICON + max(n - 1, 0) * self.GAP
+
     def relayout(self):
-        icons = self.visible_icons()
-        n = max(1, len(icons))
-        w = self.PAD * 2 + n * self.ICON + (n - 1) * self.GAP
+        w = round(self.HANDLE + (self.full_width() - self.HANDLE) * self.amt)
         screen = QGuiApplication.primaryScreen()
         scr = screen.geometry() if self.dock.taskbar_hidden else screen.availableGeometry()
         y = scr.top() + 6
         if self.dock.orient == "top":
             y = scr.top() + self.dock.height() + 4          # Dock 在顶部时让开它
-        self.setGeometry(scr.right() - w - 8, y, w, self.H)
+        self.setGeometry(scr.right() - w - 8, y, w, self.H)    # 贴着右边，往左展开
         self.update()
+
+    def set_expanded(self, on):
+        if on == self.expanded:
+            return
+        self.expanded = on
+        self.dock.cfg["tray_bar_collapsed"] = not on
+        self.dock.save_config()
+        self.anim.stop()
+        self.anim.setStartValue(self.amt)
+        self.anim.setEndValue(1.0 if on else 0.0)
+        self.anim.start()
+        if on and self.dock.cfg.get("tray_bar_autocollapse", True) and not self.underMouse():
+            self.collapse_timer.start()
+        if not on:
+            QToolTip.hideText()
+
+    def toggle(self):
+        self.set_expanded(not self.expanded)
+
+    def _on_anim(self, v):
+        self.amt = v
+        self.relayout()
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -4506,27 +4546,42 @@ class TrayBar(QWidget):
         ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
         win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex | WS_EX_NOACTIVATE)
 
+    def handle_rect(self):
+        return QRectF(0, 0, self.HANDLE, self.H)
+
     def icon_rects(self):
-        return [(ic, QRectF(self.PAD + i * (self.ICON + self.GAP), (self.H - self.ICON) / 2, self.ICON, self.ICON))
-                for i, ic in enumerate(self.visible_icons())]
+        """图标贴着右边排：展开动画时从右往左一个个露出来；被拉手挡住的不算"""
+        icons = self.visible_icons()
+        n, w = len(icons), self.width()
+        rects = []
+        for i, ic in enumerate(icons):
+            x = w - self.PAD - (n - i) * self.ICON - (n - 1 - i) * self.GAP
+            if x >= self.HANDLE - 2:
+                rects.append((ic, QRectF(x, (self.H - self.ICON) / 2, self.ICON, self.ICON)))
+        return rects
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
         th = dict(self.dock.paint_theme(), decor=None, bg="glass" if self.dock.theme["bg"] != "none" else "none")
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         p.fillRect(rect, QColor(0, 0, 0, 1))              # 透明皮肤也能接住鼠标
         paint_background(p, th, rect, None)
-        icons = self.icon_rects()
-        if not icons:
-            p.setPen(qc(th["text"]))
-            p.setFont(QFont("Microsoft YaHei UI", 8))
-            p.drawText(rect, Qt.AlignCenter, "…")
-        for i, (ic, r) in enumerate(icons):
+        # 收起 / 展开按钮：收起时是 ‹（点开），展开时是 ›（收起）
+        hr = self.handle_rect()
+        if self.hover == "handle":
+            p.setPen(Qt.NoPen)
+            p.setBrush(qc(th["text"], 40))
+            p.drawRoundedRect(hr.adjusted(4, 5, -2, -5), 6, 6)
+        f = QFont(icon_font())
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(qc(th["text"]))
+        p.drawText(hr, Qt.AlignCenter, "" if self.expanded else "")
+        for i, (ic, r) in enumerate(self.icon_rects()):
             if i == self.hover:
-                c = qc(th["text"], 40)
                 p.setPen(Qt.NoPen)
-                p.setBrush(c)
+                p.setBrush(qc(th["text"], 40))
                 p.drawRoundedRect(r.adjusted(-4, -4, 4, 4), 6, 6)
             p.drawImage(r, ic.image)
         p.end()
@@ -4538,18 +4593,29 @@ class TrayBar(QWidget):
         return None, None
 
     def mouseMoveEvent(self, e):
-        i, ic = self.icon_at(e.position())
+        if self.handle_rect().contains(e.position()):
+            i, ic = "handle", None
+        else:
+            i, ic = self.icon_at(e.position())
         if i != self.hover:
             self.hover = i
             self.update()
-            if ic is not None and ic.tip:
+            if i == "handle":
+                QToolTip.showText(e.globalPosition().toPoint() + QPoint(0, 18),
+                                  "收起托盘栏" if self.expanded else "展开托盘栏", self)
+            elif ic is not None and ic.tip:
                 QToolTip.showText(e.globalPosition().toPoint() + QPoint(0, 18), ic.tip, self)
             else:
                 QToolTip.hideText()
 
+    def enterEvent(self, _):
+        self.collapse_timer.stop()
+
     def leaveEvent(self, _):
         self.hover = None
         self.update()
+        if self.expanded and self.dock.cfg.get("tray_bar_autocollapse", True):
+            self.collapse_timer.start()
 
     def click(self, e, kind):
         _, ic = self.icon_at(e.position())
@@ -4558,12 +4624,19 @@ class TrayBar(QWidget):
             ic.send(kind, x, y)
 
     def mouseReleaseEvent(self, e):
+        if self.handle_rect().contains(e.position()):
+            if e.button() == Qt.LeftButton:
+                self.toggle()
+            return
         if e.button() == Qt.LeftButton:
             self.click(e, "left")
         elif e.button() == Qt.RightButton:
             self.click(e, "right")
 
     def mouseDoubleClickEvent(self, e):
+        if self.handle_rect().contains(e.position()):
+            self.toggle()                 # 双击拉手：Qt 把第二下算成双击，这里也要切换
+            return
         if e.button() == Qt.LeftButton:
             self.click(e, "double")
 
